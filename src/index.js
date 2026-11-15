@@ -19,7 +19,7 @@ export default {
       const u = new URL(req.url);
       if (u.pathname === "/webhook") return await handleWhatsApp(req, env, ctx);
       if (u.pathname === "/health") return new Response("ok", { headers: SEC });
-      if (u.pathname.startsWith("/api/")) return await handleApi(req, env, ctx);
+      if (u.pathname.startsWith("/api/")) { await ensure(env); return await handleApi(req, env, ctx); }
       if (req.method === "GET" || req.method === "HEAD") {
         await ensure(env);
         await env.DB.prepare("INSERT OR REPLACE INTO meta(k,v) VALUES('origin',?)").bind(u.origin).run().catch(() => {});
