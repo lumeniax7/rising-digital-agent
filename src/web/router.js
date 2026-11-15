@@ -7,7 +7,7 @@ import { json, nowISO } from "../core/util.js";
 import { log } from "../core/log.js";
 import { login, requireAuth, sessionCookie, logoutCookie } from "./auth.js";
 import { generatePost } from "../content/generator.js";
-import { publishChannel, refreshPostStatuses } from "../social/publish.js";
+import { publishChannel, publishDue, refreshPostStatuses } from "../social/publish.js";
 import { channelsEnabled, missingConfig, getMode } from "../core/config.js";
 import { ensure } from "../core/db.js";
 import { utcDay } from "../core/util.js";
@@ -114,8 +114,14 @@ export async function handleApi(req, env, ctx) {
       }
       if (u.pathname === "/api/posts/generate" && req.method === "POST") {
         const id = await generatePost(env, tid, { manual: true });
-        if (getMode(env, await settings(env)) === "auto" && id) await env.DB.prepare("INSERT OR IGNORE INTO jobs(type,payload,next_attempt_at) VALUES('publish_posts',?,?)").bind(JSON.stringify({}), nowISO()).run();
-        return jsonC(req, env, { ok: true, post_id: id });
+        const mode = getMode(env, await settings(env));
+        let published = false;
+        if (mode === "auto" && id) { // publication immédiate, pas d'attente du cron
+          await publishDue(env, tid);
+          published = true;
+        }
+        const ps = id ? (await env.DB.prepare("SELECT * FROM post_channels WHERE post_id=?").bind(id).all()).results : [];
+        return jsonC(req, env, { ok: true, post_id: id, mode, published, channels: ps });
       }
       const id = Number(seg[2]);
       if (seg[3] === "approve" && req.method === "POST") {
