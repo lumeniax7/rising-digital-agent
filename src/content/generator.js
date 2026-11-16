@@ -1,4 +1,4 @@
-// Générateur de publications : IA avec contrôles + repli par modèle de gabarit (honnête, jamais faux).
+// Générateur de publications : IA avec contrôles + repli gabarit éloquent (honnête, jamais faux).
 import { log } from "../core/log.js";
 import { runAI } from "../ai/router.js";
 import { utcDay, nowISO, jaccard } from "../core/util.js";
@@ -6,17 +6,21 @@ import { getMode } from "../core/config.js";
 import { PILLARS, pickService, markServiceUsed, recentPosts, tooSimilar } from "./editorial.js";
 
 const PHONE_DEFAULT = "+228 93 39 25 15";
-const BAD = /(\d|fcfa|cfa|€|\$|%|garanti|témoignage|satisfait|http|www\.)/i;
+const BAD = /(\d|fcfa|cfa|€|\$|garanti|témoignage|satisfait|http|www\.)/i;
 
+// Gabarit de repli ÉLOQUENT : storytelling, bénéfices concrets, appel à l'action.
+// Aucun chiffre, aucun prix, aucune promesse — juste du style.
 export function templatePost(svc, pillarIdx, phone, siteUrl) {
-  const lines = [
-    "Un conseil : adoptez un seul outil numérique à la fois et maîtrisez-le à fond avant d'en ajouter un autre.",
-    `${svc.title} : ${svc.desc}`,
-    "Entrepreneurs, ONG et PME : des solutions numériques simples, concrètes et adaptées à votre réalité.",
-    "Un besoin sur ce sujet ? Écrivez-nous, nous étudions votre projet avant tout devis.",
+  const descr = String(svc.descr || svc.desc || svc.title);
+  const d = descr.charAt(0).toLowerCase() + descr.slice(1);
+  const pillars = [
+    `💡 Le numérique, c'est comme un atelier : on avance outil par outil, et chaque outil bien maîtrisé change un quotidien.\n\n✨ Aujourd'hui, parlons de ${svc.title.toLowerCase()} — ${d}\n\nQue vous soyez entrepreneur, commerçant, ONG ou église, il y a toujours une façon plus simple, plus claire et plus professionnelle de faire les choses.`,
+    `🚀 Et si votre activité donnait enfin l'image qu'elle mérite ?\n\n${svc.title} : ${d}\n\nUne image claire attire la confiance. La confiance attire les clients. Et les clients, c'est ce qui fait vivre un projet.`,
+    `👤 Derrière chaque entreprise qui grandit, il y a des outils qui marchent et des messages qui touchent.\n\n✨ ${svc.title}, c'est ${d}\n\nNotre façon de travailler : on écoute d'abord votre réalité, on propose ensuite une solution simple, et on vous accompagne jusqu'à ce que ça marche pour vous.`,
+    `💬 Un projet en tête ? Parlons-en simplement.\n\n✨ ${svc.title} — ${d}\n\nChez Rising Digital Solutions, pas de jargon ni de discours compliqué : on étudie votre besoin, on vous montre ce qui est possible, et le devis ne vient que lorsque tout est clair pour vous.`
   ];
-  const descr = svc.descr || svc.desc || svc.title;
-  const body = `${lines[pillarIdx % 4]}\n\n${descr}\n\n📱 ${phone}\n🌐 ${siteUrl}`;
+  const hashtags = "#RisingDigital #Togo #Numérique #Entrepreneuriat";
+  const body = `${pillars[pillarIdx % 4]}\n\n${hashtags}`;
   return { text: body, generator: "gabarit" };
 }
 
@@ -28,6 +32,18 @@ export async function checkFile(env, file) {
     return t.startsWith("image/jpeg") ? null : `type ${t || "inconnu"} (JPEG exigé par Instagram)`;
   } catch (e) { return "inaccessible : " + e.message; }
 }
+
+const SYSTEM_PROMPT = `Tu es rédacteur publicitaire senior pour Rising Digital Solutions, agence polyvalente de solutions numériques à Agbelouvé (Togo) : création graphique, sites web et applications, IA, formation, maintenance informatique, photographie, sérigraphie, e-commerce, accompagnement des entrepreneurs, ONG et églises.
+
+Écris un post Facebook QUI ACCROCHE, en français :
+1. OUVRE avec une phrase qui parle de la réalité vécue (entrepreneur qui débute, boutique qui veut vendre plus, association qui veut se faire connaître) — pas de "Bonjour" ni de "Nous vous proposons".
+2. RAconte le problème en une phrase vivante.
+3. MONTRE ce que le service apporte concrètement, avec des bénéfices tangibles (visibilité, crédibilité, temps gagné, clients touchés).
+4. TERMINE par une invitation chaleureuse à écrire sur WhatsApp pour en discuter (pas de pression, pas de devis imposé).
+
+Style : humain, chaleureux, inspirant, imagé ; phrases courtes qui respirent. Longueur : 80 à 120 mots. 4 émojis maximum, placés naturellement. Termine par 4 hashtags pertinents (dont #RisingDigital et #Togo).
+
+INTERDIT ABSOLU : chiffres, prix, pourcentages, liens, promesses de résultats garantis, témoignages ou clients inventés, mots anglais inutiles. Réponds UNIQUEMENT avec le texte du post, sans introduction ni commentaire.`;
 
 export async function generatePost(env, tenantId, { manual = false } = {}) {
   const day = manual ? `${utcDay()}T${new Date().toISOString().slice(11, 19)}` : utcDay();
@@ -47,20 +63,25 @@ export async function generatePost(env, tenantId, { manual = false } = {}) {
   const recent = await recentPosts(env, tenantId);
 
   let text = "", generator = "ai", provider = null;
+  const failed = []; // fournisseurs déjà essayés : les tentatives suivantes passent au suivant
   for (let t = 1; t <= 3 && !text; t++) {
     const r = await runAI(env, "write_post", { messages: [
-      { role: "system", content: "Tu es community manager de Rising Digital Solutions (Agbelouvé, Togo), prestataire polyvalent de solutions, services, création et formation numériques. Écris en français simple, ton professionnel et chaleureux. INTERDIT : inventer clients, témoignages, prix, statistiques, promesses ; aucun chiffre, aucun lien, aucun numéro. Format : 50 à 90 mots, une accroche, 3 émojis maximum, puis 4 hashtags. Réponds uniquement avec le texte du post." },
-      { role: "user", content: `Objectif : ${PILLARS[Math.floor(Date.now() / 864e5) % PILLARS.length]}. Service : ${svc.title}. Description officielle : ${svc.descr || svc.desc || ""}` }] });
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: `Objectif éditorial du jour : ${PILLARS[Math.floor(Date.now() / 864e5) % PILLARS.length]}. Service à mettre en avant : ${svc.title}. Description officielle (à respecter, ne rien inventer au-delà) : ${svc.descr || svc.desc || ""}` }],
+      skip: failed });
     const c = String(r.text || "").trim().replace(/^["«]|["»]$/g, "");
     if (r.ok && c.length >= 40 && c.length <= 1400 && !BAD.test(c) && !tooSimilar(c, recent)) { text = c; generator = "ai"; provider = r.provider; }
-    else if (r.ok) await log(env, "warn", "texte_ia_rejete", `essai ${t} : ${c.length} car. ${r.ok && tooSimilar(c, recent) ? "(trop similaire jaccard=" + Math.max(...recent.map(x => jaccard(c, x)), 0).toFixed(2) + ")" : ""}`, tenantId);
+    else {
+      if (!r.ok) { failed.push(r.provider); if (t === 1 || failed.length === 1) await log(env, "warn", "ia_echec", `fournisseur ${r.provider} : ${r.reason}`, tenantId); }
+      else if (r.ok) await log(env, "warn", "texte_ia_rejete", `essai ${t} : ${c.length} car.${tooSimilar(c, recent) ? " (trop similaire)" : ""}`, tenantId);
+    }
   }
-  if (!text) { // repli gratuit : gabarit déterministe, HONNÊTEMENT étiqueté
+  if (!text) { // repli gratuit : gabarit éloquent, HONNÊTEMENT étiqueté
     const tpl = templatePost(svc, Math.floor(Date.now() / 864e5), phones[0], settings.site_url);
     text = tpl.text; generator = tpl.generator;
-    await log(env, "warn", "repli_gabarit", "IA indisponible ou quota atteint : texte gabarit utilisé", tenantId);
+    await log(env, "warn", "repli_gabarit", "IA indisponible ou quota atteint : texte gabarit (éloquent) utilisé", tenantId);
   }
-  const full = `${text}\n\nÉcrivez-nous sur WhatsApp : ${phones[0]}\n${settings.site_url}`;
+  const full = `${text}\n\n📱 Écrivez-nous sur WhatsApp : ${phones[0]}\n🌐 ${settings.site_url}`;
   const status = mode === "auto" ? "approved" : mode === "approval" ? "pending" : "draft";
 
   const r = await env.DB.prepare("INSERT INTO posts(tenant_id,day,title,text,image,status,generator,updated_at) VALUES(?,?,?,?,?,?,?,?)")
@@ -71,7 +92,6 @@ export async function generatePost(env, tenantId, { manual = false } = {}) {
     .bind(tenantId, "affiche", svc.title, svc.file, imageUrl, "ready").run();
   await log(env, "info", "post_genere", `#${postId} service=${svc.title} statut=${status} moteur=${generator}${provider ? " via " + provider : ""}`, tenantId);
 
-  // Canaux cibles : file d'attente si configuré, sinon état honnête « non configuré ».
   const chEn = { facebook: !!(env.FB_PAGE_ID && env.FB_PAGE_TOKEN), instagram: !!(env.IG_USER_ID && (env.IG_TOKEN || env.FB_PAGE_TOKEN)), tiktok: true };
   for (const ch of ["facebook", "instagram", "tiktok"])
     await env.DB.prepare("INSERT OR IGNORE INTO post_channels(post_id,channel,status) VALUES(?,?,?)")

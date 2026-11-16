@@ -19,6 +19,8 @@ export function ensure(env) {
       ["chat_reply", "llama-3.1-8b", "workers-ai", "@cf/meta/llama-3.1-8b-instruct", 10],
       ["idea", "llama-3.1-8b", "workers-ai", "@cf/meta/llama-3.1-8b-instruct", 20],
       ["summarize", "llama-3.1-8b", "workers-ai", "@cf/meta/llama-3.1-8b-instruct", 20],
+      ["write_post", "llama-3.3-70b", "workers-ai", "@cf/meta/llama-3.3-70b-instruct-fp8-fast", 15],
+      ["chat_reply", "llama-3.3-70b", "workers-ai", "@cf/meta/llama-3.3-70b-instruct-fp8-fast", 15],
     ];
     for (const [task, name, adapter, model, prio] of provs)
       await env.DB.prepare("INSERT OR IGNORE INTO ai_providers(task,name,adapter,model,priority,daily_limit) VALUES(?,?,?,?,?,?)")
