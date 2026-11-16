@@ -27,4 +27,5 @@ GRAPH_VERSION = "v23.0"          # à vérifier sur developers.facebook.com/docs
 MODE = "test"                    # test = rien n'est publié | approval = validation manuelle | auto = publication automatique
 WA_COOLDOWN_H = "6"              # délai anti-spam entre 2 réponses automatiques au même contact (heures)
 AI_DAILY_LIMIT = "200"           # garde-fou global d'appels IA / jour (le quota gratuit Workers AI est limité)
-ALLOWED_ORIGIN = "https://lumeniax7.github.io"  # miroir GitHub Pages autorisé à appeler l'API (CORS)
+ALLOWED_ORIGIN = "https://lumeniax7.github.io"
+IMAGE_BASE = "https://rising-digital-agent.yesborntoshine.workers.dev"  # adresse publique des affiches (figée, immune aux visites d'aperçu)  # miroir GitHub Pages autorisé à appeler l'API (CORS)

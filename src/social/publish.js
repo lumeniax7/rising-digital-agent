@@ -49,12 +49,28 @@ export async function publishChannel(env, post, pc) {
 // Reprise des publications interrompues + traitement des canaux dus.
 export async function publishDue(env, tenantId, limit = 3) {
   await env.DB.prepare("UPDATE post_channels SET status='error', last_error=COALESCE(last_error,'')||' | interrompu (délai dépassé)' WHERE status='publishing' AND updated_at<datetime('now','-15 minutes')").run();
+  await rebaselineImageUrls(env, tenantId);
   const due = (await env.DB.prepare(
     `SELECT pc.*, p.text, p.image, p.title FROM post_channels pc JOIN posts p ON p.id=pc.post_id
      WHERE pc.status IN ('queued','error') AND (pc.next_attempt_at IS NULL OR pc.next_attempt_at<=?) AND p.tenant_id=?
      ORDER BY pc.id LIMIT ?`).bind(nowISO(), tenantId, limit).all()).results;
   for (const pc of due) await publishChannel(env, { id: pc.post_id, text: pc.text, image: pc.image, title: pc.title }, pc);
   await refreshPostStatuses(env, tenantId);
+}
+
+// Reconstruit l'URL d'image de chaque post à partir de l'origine courante (protège contre
+// un enregistrement d'origine erroné, ex. préfixe workers.dev d'aperçu).
+async function rebaselineImageUrls(env, tenantId) {
+  const origin = env.IMAGE_BASE || (await env.DB.prepare("SELECT v FROM meta WHERE k='origin'").first())?.v;
+  if (!origin) return;
+  const rows = (await env.DB.prepare("SELECT id, image FROM posts WHERE tenant_id=?").bind(tenantId).all()).results;
+  for (const r of rows) {
+    const file = String(r.image || "").split("/affiches/")[1];
+    if (file) {
+      const want = `${origin.replace(/\/$/, "")}/affiches/${file}`;
+      if (want !== r.image) await env.DB.prepare("UPDATE posts SET image=? WHERE id=?").bind(want, r.id).run();
+    }
+  }
 }
 
 // Recalcule le statut GLOBAL de chaque post à partir de ses canaux (succès partiel ≠ succès complet).
