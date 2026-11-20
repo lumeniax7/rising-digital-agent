@@ -1,6 +1,7 @@
 // Tableau de bord Rising Digital Agent — SPA française, sans dépendance externe.
 const $ = (s, r = document) => r.querySelector(s);
-const state = { csrf: null, view: "home", open: false };
+const state = { csrf: null, view: "home" };
+let refreshTimer = null;
 const DEFAULT_API = "https://rising-digital-agent.yesborntoshine.workers.dev";
 const API_BASE = new URLSearchParams(location.search).get("api") ?? (location.hostname.endsWith(".github.io") ? DEFAULT_API : "");
 const api = async (path, opts = {}) => {
@@ -21,7 +22,7 @@ $("#login-form").addEventListener("submit", async e => {
   try {
     const r = await api("/api/login", { method: "POST", body: JSON.stringify({ username: f.get("username"), password: f.get("password") }) });
     state.csrf = r.csrf; enter(r.user);
-  } catch (err) { $("#login-error").textContent = err.message + " — si le mot de passe est oublié : supprimez le secret ADMIN_PASSWORD dans Cloudflare (mode ouvert), ou redéfinissez-le puis rechargez la page."; }
+  } catch (err) { $("#login-error").textContent = err.message; }
 });
 $("#logout").addEventListener("click", () => api("/api/logout", { method: "POST" }).finally(() => location.reload()));
 document.getElementById("nav").addEventListener("click", e => {
@@ -30,7 +31,7 @@ document.getElementById("nav").addEventListener("click", e => {
   a.classList.add("active"); state.view = a.dataset.view; render();
 });
 
-function enter(user) { $("#login").classList.add("hidden"); $("#app").classList.remove("hidden"); render(); setInterval(render, 60000); }
+function enter(user) { $("#login").classList.add("hidden"); $("#app").classList.remove("hidden"); render(); if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(render, 60000); }
 function show(id) { $(id === "login" ? "#login" : "#app").classList.remove("hidden"); if (id !== "login") $("#app").classList.remove("hidden"); }
 
 async function render() {
@@ -52,9 +53,8 @@ async function render() {
 
 async function viewHome(m) {
   const [s, ev] = await Promise.all([api("/api/state"), api("/api/events")]);
-  $("#mode-badge").textContent = "mode : " + s.mode;
-  if (s.open) state.csrf = s.csrf;
-  const openBanner = s.open ? `<div class="card" style="border-color:#f59e0b"><b>🔓 Mode ouvert — connexion désactivée.</b> Toute personne ayant l'adresse du tableau de bord peut l'utiliser (y compris répondre aux clients). Pour réactiver une connexion : Cloudflare → votre Worker → Settings → Variables and Secrets → ajoutez <code>ADMIN_PASSWORD</code> (8 caractères minimum), puis redéployez.</div>` : "";
+  $("#mode-badge").textContent = `mode : ${s.mode} (${s.mode_source || "MODE"})`;
+  state.csrf = s.csrf;
   const ch = s.channels, noCh = !ch.facebook && !ch.instagram && !ch.whatsapp;
   const why = noCh ? `<div class="card" style="border-color:#ef4444"><b>🔎 Pourquoi rien n'est publié sur Facebook / Instagram / WhatsApp ?</b>
     <ol style="margin:8px 0 0 18px">
@@ -65,7 +65,7 @@ async function viewHome(m) {
     </ol></div>` : "";
   const miss = s.missing.length ? `<div class="card"><b>⚠️ Configuration incomplète</b><ul>${s.missing.map(x => `<li><code>${x.key}</code> — ${esc(x.usage)}</li>`).join("")}</ul></div>` : "";
   const alerts = ev.events.filter(e => e.level === "error").slice(0, 5);
-  m.innerHTML = `<h2>Accueil</h2><p class="muted">${Object.entries(s.channels).map(([k, v]) => `${v ? "🟢" : "⚪"} ${k}`).join(" · ")}</p>${openBanner}${why}${miss}
+  m.innerHTML = `<h2>Accueil</h2><p class="muted">${Object.entries(s.channels).map(([k, v]) => `${v ? "🟢" : "⚪"} ${k}`).join(" · ")}</p>${why}${miss}
     <div class="grid g2" style="margin:14px 0">
       <div class="card kpi"><b>${s.counts.published || 0}</b><span>publications confirmées</span></div>
       <div class="card kpi"><b>${s.counts.partial || 0}</b><span>publications partielles</span></div>
@@ -180,7 +180,7 @@ async function viewSettings(m) {
     </div>
     <label style="margin-top:10px">Numéros WhatsApp (un par ligne)<textarea name="phones">${f.contact_phones.join("\n")}</textarea></label>
     <label>Webhook de notification des rapports (optionnel, https, ex. https://ntfy.sh/votre-canal)<input name="report_webhook_url" value="${esc(f.report_webhook_url)}"></label>
-    <p class="muted">Mode actuel : ${s.mode} (changez la variable MODE dans Cloudflare : test → approval → auto). Les secrets se configurent dans Cloudflare > Settings > Variables and secrets — jamais ici.</p>
+    <p class="muted">Mode effectif : ${s.mode} (source : ${s.mode_source || "MODE"}). Les anciens réglages <code>meta.mode</code> ont priorité sur la variable <code>MODE</code>; modifiez le mode dans la source affichée. Les secrets se configurent dans Cloudflare > Settings > Variables and Secrets — jamais ici.</p>
     <button>Enregistrer</button></form></div>`;
   $("#st").addEventListener("submit", async e => { e.preventDefault(); const fd = new FormData(e.target);
     await api("/api/settings", { method: "PUT", body: JSON.stringify({
@@ -191,7 +191,7 @@ async function viewSettings(m) {
 
 // reprise de session existante au chargement
 fetch(API_BASE + "/api/state", { credentials: API_BASE ? "include" : "same-origin" }).then(async r => {
-  if (r.ok) { const st = await r.json(); state.open = !!st.open; if (st.open) state.csrf = st.csrf;
-    $("#app").classList.remove("hidden"); if (st.open) $("#mode-badge").textContent = "mode ouvert (sans connexion)"; render(); }
+  if (r.ok) { const st = await r.json(); state.csrf = st.csrf || null;
+    $("#app").classList.remove("hidden"); enter(st.user); }
   else $("#login").classList.remove("hidden");
 }).catch(() => $("#login").classList.remove("hidden"));

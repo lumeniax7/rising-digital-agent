@@ -1,5 +1,5 @@
-// Schéma D1 versionné. Chaque instruction est idempotente (exécution sûre au démarrage
-// ET via `npm run db:init` avec migrations/0001_init.sql — même contenu).
+// Schéma D1 déclaré par le Worker; les migrations de `migrations/` servent au bootstrap
+// explicite, tandis que ces CREATE IF NOT EXISTS rendent les tables compatibles au démarrage.
 export const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)",
   `CREATE TABLE IF NOT EXISTS tenants(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, slug TEXT UNIQUE NOT NULL,
@@ -58,5 +58,11 @@ export const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS rate_limit(bucket TEXT NOT NULL, window_start TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(bucket, window_start))",
   "CREATE INDEX IF NOT EXISTS idx_pc_status ON post_channels(status, next_attempt_at)",
   "CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, next_attempt_at)",
-  "CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id)"
+  "CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id)",
+  `CREATE TABLE IF NOT EXISTS wa_inbox(
+     wamid TEXT PRIMARY KEY, tenant_id INTEGER NOT NULL, sender TEXT NOT NULL, payload TEXT NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed')),
+     attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, claimed_at TEXT,
+     reply_external_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`,
+  "CREATE INDEX IF NOT EXISTS idx_wa_inbox_due ON wa_inbox(status, next_attempt_at, claimed_at)"
 ];

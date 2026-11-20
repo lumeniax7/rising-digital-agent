@@ -3,7 +3,7 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 
 [triggers]
-crons = ["0 7 * * *", "30 7 * * *"]   # 07h00 UTC = génération/publication (07h00 à Lomé) ; 07h30 UTC = rapport quotidien
+crons = ["0 7 * * *", "30 7 * * *", "*/15 * * * *"]   # 07h00 génération, 07h30 rapport (Lomé=UTC), reprises toutes les 15 min
 
 [ai]
 binding = "AI"
@@ -21,10 +21,10 @@ binding = "ASSETS"
 enabled = true
 
 [vars]
-# Variables NON secrètes (modifiables aussi depuis le tableau de bord, table `meta`)
+# Variables NON secrètes. Les anciens enregistrements `meta.mode` restent prioritaires sur MODE.
 SITE_URL = "https://risingdigitalsolutions.pages.dev"
 GRAPH_VERSION = "v23.0"          # à vérifier sur developers.facebook.com/docs/graph-api/changelog avant mise à jour
-MODE = "test"                    # test = rien n'est publié | approval = validation manuelle | auto = publication automatique
+MODE = "auto"                    # conserve le mode actif en production; .dev.vars.example force test en local
 WA_COOLDOWN_H = "6"              # délai anti-spam entre 2 réponses automatiques au même contact (heures)
 AI_DAILY_LIMIT = "200"           # garde-fou global d'appels IA / jour (le quota gratuit Workers AI est limité)
 ALLOWED_ORIGIN = "https://lumeniax7.github.io"

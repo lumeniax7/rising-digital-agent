@@ -57,8 +57,9 @@ export async function generatePost(env, tenantId, { manual = false } = {}) {
   if (!origin) throw new Error("adresse publique inconnue : ouvrez une fois le tableau de bord");
   const imageUrl = `${origin.replace(/\/$/, "")}/affiches/${svc.file}`;
 
-  const mode = getMode(env, Object.fromEntries((await env.DB.prepare("SELECT k,v FROM meta").all()).results.map(r => [r.k, r.v])));
-  const settings = { site_url: env.SITE_URL };
+  const meta = Object.fromEntries((await env.DB.prepare("SELECT k,v FROM meta").all()).results.map(r => [r.k, r.v]));
+  const mode = getMode(env, meta);
+  const settings = { site_url: meta.site_url || env.SITE_URL };
   const phones = JSON.parse((await env.DB.prepare("SELECT v FROM meta WHERE k='contact_phones'").first())?.v || "null") || [PHONE_DEFAULT];
   const recent = await recentPosts(env, tenantId);
 

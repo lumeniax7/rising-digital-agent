@@ -2,33 +2,114 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runAI } from "../src/ai/router.js";
 import { templatePost } from "../src/content/generator.js";
+import { utcDay } from "../src/core/util.js";
 
-// Environnement D1 factice (en mémoire) pour tester le routeur sans Workers.
-function fakeDb() {
-  const rows = { ai_providers: [
-    { id: 1, name: "a", task: "write_post", adapter: "workers-ai", model: "m1", priority: 10, enabled: 1, daily_limit: 2 },
-    { id: 2, name: "b", task: "write_post", adapter: "workers-ai", model: "m2", priority: 20, enabled: 1, daily_limit: 0 },
-  ], ai_usage: [] };
-  return {
-    prepare: sql => ({
-      bind: (..._a) => ({
-        all: async () => ({ results: sql.includes("ai_providers") ? rows.ai_providers.filter(p => p.task === "write_post" && p.enabled) : rows.ai_usage }),
-        first: async () => { const d = rows.ai_usage.find(u => u.day === "2026-01-01" && u.provider === "a"); return d && d.calls >= 2 ? { calls: 2 } : null; },
-        run: async () => { rows.ai_usage.push({ day: "2026-01-01", provider: "a", calls: 99, errors: 0 }); return { meta: { changes: 1 } }; },
-      }),
-      run: async () => ({ meta: { changes: 0 } }),
-      first: async () => null,
-      all: async () => ({ results: [] }),
-    }),
+function fakeDb({ providers, usage = [], meta = [] }) {
+  const usageRows = new Map(usage.map(x => [`${x.day}/${x.provider}/${x.task}`, { ...x }]));
+  const metaRows = new Map(meta.map(x => [x.k, String(x.v)]));
+  const db = {
+    usageRows,
+    metaRows,
+    prepare(sql) {
+      return {
+        bind(...args) {
+          return {
+            all: async () => {
+              if (sql.includes("FROM ai_providers")) {
+                const task = args[0];
+                return { results: providers.filter(p => p.task === task && p.enabled).sort((a, b) => a.priority - b.priority) };
+              }
+              return { results: [] };
+            },
+            first: async () => null,
+            run: async () => {
+              if (sql.includes("INSERT INTO ai_usage")) {
+                const [day, provider, task, limit] = args;
+                const key = `${day}/${provider}/${task}`;
+                const row = usageRows.get(key);
+                if (!row) usageRows.set(key, { day, provider, task, calls: 1, errors: 0 });
+                else if (!(Number(limit) > 0) || row.calls < Number(limit)) row.calls++;
+                else return { meta: { changes: 0 } };
+                return { meta: { changes: 1 } };
+              }
+              if (sql.includes("UPDATE ai_usage SET calls=CASE")) {
+                const [day, provider, task] = args;
+                const row = usageRows.get(`${day}/${provider}/${task}`);
+                if (row) row.calls = Math.max(0, row.calls - 1);
+                return { meta: { changes: row ? 1 : 0 } };
+              }
+              if (sql.includes("UPDATE ai_usage SET errors=errors+1")) {
+                const [day, provider, task] = args;
+                const row = usageRows.get(`${day}/${provider}/${task}`);
+                if (row) row.errors++;
+                return { meta: { changes: row ? 1 : 0 } };
+              }
+              if (sql.includes("INSERT INTO meta")) {
+                const [key, limit] = args;
+                const current = Number(metaRows.get(key) || 0);
+                if (current >= Number(limit)) return { meta: { changes: 0 } };
+                metaRows.set(key, String(current + 1));
+                return { meta: { changes: 1 } };
+              }
+              return { meta: { changes: 0 } };
+            },
+          };
+        },
+      };
+    },
   };
+  return db;
 }
 
-test("routeur IA : le quota épuisé fait basculer vers le fournisseur suivant", async () => {
-  const env = { DB: fakeDb(), AI: { run: async (_m, o) => ({ response: "OK:" + o.messages.at(-1).content }) } };
-  // le fournisseur "a" (priorité 10) est saturé : runAI doit utiliser "b" — le test vérifie surtout qu'aucune exception ne fuit
-  const r = await runAI(env, "write_post", { prompt: "test" });
-  assert.ok(r.ok || r.reason.includes("quota"));
+const providers = [
+  { id: 1, name: "a", task: "write_post", adapter: "workers-ai", model: "m1", priority: 10, enabled: 1, daily_limit: 2 },
+  { id: 2, name: "b", task: "write_post", adapter: "workers-ai", model: "m2", priority: 20, enabled: 1, daily_limit: 0 },
+];
+
+test("quota global quotidien atteint : aucun nouvel appel externe n'est lancé", async () => {
+  const DB = fakeDb({ providers });
+  let calls = 0;
+  const env = { DB, AI_DAILY_LIMIT: "1", AI: { run: async () => { calls++; return { response: "Texte valide" }; } } };
+  const [first, second] = await Promise.all([
+    runAI(env, "write_post", { prompt: "test" }),
+    runAI(env, "write_post", { prompt: "test" }),
+  ]);
+  assert.equal([first, second].filter(r => r.ok).length, 1);
+  const rejected = [first, second].find(r => !r.ok);
+  assert.match(rejected.reason, /plafond IA quotidien global atteint/);
+  assert.equal(calls, 1);
+  assert.equal(DB.metaRows.get(`ai_daily_calls:${utcDay()}`), "1");
+  assert.equal(DB.usageRows.get(`${utcDay()}/a/write_post`).calls, 1);
 });
+
+test("échec du premier fournisseur : cascade vers le suivant et erreurs comptées", async () => {
+  const DB = fakeDb({ providers });
+  let calls = 0;
+  const env = {
+    DB,
+    AI_DAILY_LIMIT: "10",
+    AI: { run: async () => { calls++; if (calls === 1) throw new Error("panne amont"); return { response: "Réponse du second fournisseur" }; } },
+  };
+  const r = await runAI(env, "write_post", { prompt: "test" });
+  assert.equal(r.ok, true);
+  assert.match(r.provider, /^b /);
+  assert.equal(calls, 2);
+  assert.deepEqual(DB.usageRows.get(`${utcDay()}/a/write_post`), { day: utcDay(), provider: "a", task: "write_post", calls: 1, errors: 1 });
+  assert.deepEqual(DB.usageRows.get(`${utcDay()}/b/write_post`), { day: utcDay(), provider: "b", task: "write_post", calls: 1, errors: 0 });
+  assert.equal(DB.metaRows.get(`ai_daily_calls:${utcDay()}`), "2");
+});
+
+test("quota quotidien fournisseur : bascule vers un fournisseur disponible", async () => {
+  const DB = fakeDb({ providers, usage: [{ day: utcDay(), provider: "a", task: "write_post", calls: 2, errors: 0 }] });
+  let selectedModel;
+  const env = { DB, AI_DAILY_LIMIT: "10", AI: { run: async model => { selectedModel = model; return { response: "OK" }; } } };
+  const r = await runAI(env, "write_post", { prompt: "test" });
+  assert.equal(r.ok, true);
+  assert.equal(selectedModel, "m2");
+  assert.equal(DB.usageRows.get(`${utcDay()}/a/write_post`).calls, 2);
+  assert.equal(DB.metaRows.get(`ai_daily_calls:${utcDay()}`), "1");
+});
+
 test("repli gabarit : texte honnête, sans prix ni chiffres", () => {
   const svc = { title: "Création de site et application", desc: "Être trouvé, expliquer son offre et recevoir des demandes depuis mobile." };
   const t = templatePost(svc, 1, "+228 00 00 00 00", "https://exemple.test");
