@@ -1,4 +1,5 @@
 // Tableau de bord Rising Digital Agent — SPA française, sans dépendance externe.
+import { apiFailure } from "./auth-errors.js";
 const $ = (s, r = document) => r.querySelector(s);
 const state = { csrf: null, view: "home" };
 let refreshTimer = null;
@@ -7,9 +8,10 @@ const API_BASE = new URLSearchParams(location.search).get("api") ?? (location.ho
 const api = async (path, opts = {}) => {
   const r = await fetch(API_BASE + path, { credentials: API_BASE ? "include" : "same-origin",
     headers: { ...(state.csrf ? { "x-csrf": state.csrf } : {}) }, ...opts });
-  if (r.status === 401) { show("login"); throw new Error("Session expirée"); }
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  const failure = apiFailure(path, r.ok, r.status, data);
+  if (failure?.requiresLogin) show("login");
+  if (failure) throw new Error(failure.message);
   return data;
 };
 const toast = (msg, cls = "") => { const d = document.createElement("div"); d.className = cls; d.textContent = msg; $("#toast").append(d); setTimeout(() => d.remove(), 4000); };
@@ -32,7 +34,12 @@ document.getElementById("nav").addEventListener("click", e => {
 });
 
 function enter(user) { $("#login").classList.add("hidden"); $("#app").classList.remove("hidden"); render(); if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(render, 60000); }
-function show(id) { $(id === "login" ? "#login" : "#app").classList.remove("hidden"); if (id !== "login") $("#app").classList.remove("hidden"); }
+function show(id) {
+  const login = id === "login";
+  $("#login").classList.toggle("hidden", !login);
+  $("#app").classList.toggle("hidden", login);
+  if (login) state.csrf = null;
+}
 
 async function render() {
   const m = $("#main");
