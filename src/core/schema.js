@@ -64,5 +64,19 @@ export const SCHEMA = [
      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed')),
      attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, claimed_at TEXT,
      reply_external_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`,
-  "CREATE INDEX IF NOT EXISTS idx_wa_inbox_due ON wa_inbox(status, next_attempt_at, claimed_at)"
+  "CREATE INDEX IF NOT EXISTS idx_wa_inbox_due ON wa_inbox(status, next_attempt_at, claimed_at)",
+  `CREATE TABLE IF NOT EXISTS wa_template_queue(
+     source_wamid TEXT PRIMARY KEY, tenant_id INTEGER NOT NULL,
+     status TEXT NOT NULL DEFAULT 'waiting_approval' CHECK(status IN ('waiting_approval','processing','sent','failed','skipped')),
+     attempts INTEGER NOT NULL DEFAULT 0, claimed_at TEXT, last_error TEXT, external_id TEXT,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`,
+  "CREATE INDEX IF NOT EXISTS idx_wa_template_queue_due ON wa_template_queue(status, created_at, claimed_at)",
+  `CREATE TABLE IF NOT EXISTS wa_recipient_blocks(
+     phone_normalized TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT 'owner_request',
+     created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`,
+  "CREATE INDEX IF NOT EXISTS idx_wa_recipient_blocks_created ON wa_recipient_blocks(created_at)",
+  `CREATE TABLE IF NOT EXISTS wa_automation_optouts(
+     tenant_id INTEGER NOT NULL, phone_normalized TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+     PRIMARY KEY(tenant_id, phone_normalized))`
 ];

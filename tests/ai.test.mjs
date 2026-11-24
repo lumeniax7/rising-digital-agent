@@ -21,7 +21,14 @@ function fakeDb({ providers, usage = [], meta = [] }) {
               }
               return { results: [] };
             },
-            first: async () => null,
+            first: async () => {
+              if (sql.includes("SELECT calls,errors FROM ai_usage")) {
+                const [day, provider, task] = args;
+                const row = usageRows.get(`${day}/${provider}/${task}`);
+                return row ? { calls: row.calls, errors: row.errors } : null;
+              }
+              return null;
+            },
             run: async () => {
               if (sql.includes("INSERT INTO ai_usage")) {
                 const [day, provider, task, limit] = args;
@@ -97,6 +104,18 @@ test("échec du premier fournisseur : cascade vers le suivant et erreurs compté
   assert.deepEqual(DB.usageRows.get(`${utcDay()}/a/write_post`), { day: utcDay(), provider: "a", task: "write_post", calls: 1, errors: 1 });
   assert.deepEqual(DB.usageRows.get(`${utcDay()}/b/write_post`), { day: utcDay(), provider: "b", task: "write_post", calls: 1, errors: 0 });
   assert.equal(DB.metaRows.get(`ai_daily_calls:${utcDay()}`), "2");
+});
+
+test("coupe-circuit saute un fournisseur qui échoue régulièrement", async () => {
+  const DB = fakeDb({ providers, usage: [{ day: utcDay(), provider: "a", task: "write_post", calls: 99, errors: 99 }] });
+  let calls = 0;
+  const env = { DB, AI_DAILY_LIMIT: "10", AI: { run: async model => { calls++; assert.equal(model, "m2"); return { response: "Réponse du fournisseur sain" }; } } };
+  const r = await runAI(env, "write_post", { prompt: "test" });
+  assert.equal(r.ok, true);
+  assert.match(r.provider, /^b /);
+  assert.equal(calls, 1);
+  assert.equal(DB.metaRows.get(`ai_daily_calls:${utcDay()}`), "1");
+  assert.equal(DB.usageRows.get(`${utcDay()}/a/write_post`).calls, 99);
 });
 
 test("quota quotidien fournisseur : bascule vers un fournisseur disponible", async () => {

@@ -63,3 +63,57 @@ async function maybeNotify(env, content) {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
   } catch (e) { await log(env, "warn", "notification_echec", e.message); }
 }
+
+
+/**
+ * Surveillance de file exécutée par le cron Worker. Les alertes sont agrégées,
+ * dédupliquées dans D1 et ne contiennent aucune donnée de contact.
+ */
+export async function monitorWhatsAppQueue(env) {
+  const destination = (await env.DB.prepare("SELECT v FROM meta WHERE k='report_webhook_url'").first())?.v;
+  if (!destination) return { configured: false, notified: false };
+
+  const threshold = Math.max(1, Math.min(100, Number(env.WA_ALERT_FAILED_THRESHOLD) || 1));
+  const inbox = (await env.DB.prepare(`SELECT
+    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+    SUM(CASE WHEN status='processing' AND claimed_at<=datetime('now','-10 minutes') THEN 1 ELSE 0 END) AS stale_processing,
+    MIN(CASE WHEN status='pending' THEN created_at END) AS oldest_pending
+    FROM wa_inbox`).first()) || {};
+  const template = (await env.DB.prepare(`SELECT
+    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+    SUM(CASE WHEN status='processing' AND claimed_at<=datetime('now','-10 minutes') THEN 1 ELSE 0 END) AS stale_processing
+    FROM wa_template_queue`).first()) || {};
+  const incidents = [];
+  const failed = Number(inbox.failed || 0) + Number(template.failed || 0);
+  const staleProcessing = Number(inbox.stale_processing || 0) + Number(template.stale_processing || 0);
+  const oldestPendingRaw = String(inbox.oldest_pending || "");
+  const oldestPendingIso = oldestPendingRaw && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(oldestPendingRaw)
+    ? oldestPendingRaw : oldestPendingRaw.replace(" ", "T") + "Z";
+  const oldestPendingMs = oldestPendingIso ? Date.parse(oldestPendingIso) : NaN;
+  const oldPending = Number.isFinite(oldestPendingMs) && Date.now() - oldestPendingMs > 60 * 60_000;
+  if (failed >= threshold) incidents.push("échecs");
+  if (staleProcessing > 0) incidents.push("processing_bloqué");
+  if (oldPending) incidents.push("pending_ancien");
+
+  const fingerprint = incidents.sort().join(",");
+  const previous = (await env.DB.prepare("SELECT v FROM meta WHERE k='wa_queue_alert_fingerprint'").first())?.v || "";
+  if (fingerprint === previous) return { configured: true, notified: false, incidents: fingerprint };
+  if (!fingerprint && !previous) return { configured: true, notified: false, incidents: "" };
+
+  const content = fingerprint
+    ? `Alerte WhatsApp Rising Digital Agent : incidents=${fingerprint}; échecs=${failed}; pending=${Number(inbox.pending || 0)}; processing_expirés=${staleProcessing}. Aucun contenu de message ni numéro client n’est inclus.`
+    : "Rétablissement WhatsApp Rising Digital Agent : les alertes de file précédentes ne sont plus détectées.";
+  try {
+    const response = await fetch(destination, { method: "POST", body: content,
+      headers: { "content-type": "text/plain" }, signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    await env.DB.prepare(`INSERT INTO meta(k,v) VALUES('wa_queue_alert_fingerprint',?)
+      ON CONFLICT(k) DO UPDATE SET v=excluded.v`).bind(fingerprint).run();
+    await log(env, "info", "wa_alerte_webhook_envoyee", `incidents=${fingerprint || "aucun"}`);
+    return { configured: true, notified: true, incidents: fingerprint };
+  } catch (error) {
+    await log(env, "warn", "wa_alerte_webhook_echec", String(error?.message || "erreur réseau").slice(0, 120));
+    return { configured: true, notified: false, incidents: fingerprint, error: true };
+  }
+}

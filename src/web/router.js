@@ -11,9 +11,9 @@ import { channelsEnabled, missingConfig, getMode } from "../core/config.js";
 import { ensure } from "../core/db.js";
 import { utcDay } from "../core/util.js";
 import { readJsonBody, validPublicHttpsUrl } from "./security.js";
+import { normalizeWhatsAppRecipient } from "../social/whatsapp-recipient-policy.js";
 
 const BASE = { "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", "x-frame-options": "DENY" };
-
 function cors(req, env, extra = {}) {
   const origin = req.headers.get("origin");
   const h = { ...BASE, ...extra };
@@ -157,16 +157,41 @@ export async function handleApi(req, env, ctx) {
         return jsonC(req, env, { conversations: rows });
       }
       const cid = Number(seg[2]);
-      if (req.method === "GET") return jsonC(req, env, { messages: (await env.DB.prepare("SELECT * FROM messages WHERE conversation_id=? AND tenant_id=? ORDER BY id").bind(cid, tid).all()).results });
+      if (req.method === "GET") {
+        const conv = await env.DB.prepare("SELECT c.handoff,ct.external_id FROM conversations c JOIN contacts ct ON ct.id=c.contact_id WHERE c.id=? AND c.tenant_id=?").bind(cid, tid).first();
+        if (!conv) return jsonC(req, env, { error: "conversation introuvable" }, 404);
+        const messages = (await env.DB.prepare("SELECT * FROM messages WHERE conversation_id=? AND tenant_id=? ORDER BY id").bind(cid, tid).all()).results;
+        const optOut = await env.DB.prepare("SELECT 1 AS found FROM wa_automation_optouts WHERE tenant_id=? AND phone_normalized=?")
+          .bind(tid, normalizeWhatsAppRecipient(conv.external_id)).first();
+        return jsonC(req, env, { messages, handoff: Number(conv.handoff) === 1, customer_stop_requested: Boolean(optOut) });
+      }
+      if (seg[3] === "resume" && req.method === "POST") {
+        const conv = await env.DB.prepare("SELECT c.id,ct.external_id FROM conversations c JOIN contacts ct ON ct.id=c.contact_id WHERE c.id=? AND c.tenant_id=?").bind(cid, tid).first();
+        if (!conv) return jsonC(req, env, { error: "conversation introuvable" }, 404);
+        const optOut = await env.DB.prepare("SELECT 1 AS found FROM wa_automation_optouts WHERE tenant_id=? AND phone_normalized=?")
+          .bind(tid, normalizeWhatsAppRecipient(conv.external_id)).first();
+        if (optOut)
+          return jsonC(req, env, { error: "Le contact a demandé l’arrêt. Attendez qu’il envoie lui-même « REPRENDRE » avant de réactiver l’automatisation." }, 409);
+        await env.DB.prepare("UPDATE conversations SET handoff=0 WHERE id=? AND tenant_id=?").bind(cid, tid).run();
+        await log(env, "info", "wa_automatisation_reprise", `conversation #${cid}`, tid);
+        return jsonC(req, env, { ok: true });
+      }
       if (seg[3] === "reply" && req.method === "POST") {
-        const b = requestBody
+        const b = requestBody;
         const conv = await env.DB.prepare("SELECT c.*, ct.external_id FROM conversations c JOIN contacts ct ON ct.id=c.contact_id WHERE c.id=? AND c.tenant_id=?").bind(cid, tid).first();
         if (!conv) return jsonC(req, env, { error: "conversation introuvable" }, 404);
+        const optOut = await env.DB.prepare("SELECT 1 AS found FROM wa_automation_optouts WHERE tenant_id=? AND phone_normalized=?")
+          .bind(tid, normalizeWhatsAppRecipient(conv.external_id)).first();
+        if (optOut) return jsonC(req, env, { error: "Le contact a demandé l’arrêt; aucun message ne peut être envoyé avant sa commande « REPRENDRE »." }, 409);
+        const body = String(b.body || "").trim().slice(0, 4096);
+        if (!body) return jsonC(req, env, { error: "Le message ne peut pas être vide." }, 400);
+        // Suspendre le bot avant l’appel réseau : une génération IA en cours échouera à sa vérification finale.
+        await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=? AND tenant_id=?").bind(cid, tid).run();
         const { send } = await import("../social/whatsapp.js");
-        const j = await send(env, conv.external_id, String(b.body || "").slice(0, 4096));
+        const j = await send(env, conv.external_id, body);
         if (!j.messages?.[0]?.id) throw new Error("envoi WhatsApp sans identifiant");
         await env.DB.prepare("INSERT INTO messages(tenant_id,conversation_id,direction,external_id,body,ts) VALUES(?,?,?,?,?,?)")
-          .bind(tid, cid, "out", j.messages[0].id, b.body, nowISO()).run();
+          .bind(tid, cid, "out", j.messages[0].id, body, nowISO()).run();
         await log(env, "info", "wa_reponse_manuelle", `conversation #${cid}`, tid);
         return jsonC(req, env, { ok: true });
       }

@@ -3,6 +3,8 @@
 import { utcDay } from "../core/util.js";
 
 const GLOBAL_LIMIT_DEFAULT = 200;
+const PROVIDER_CIRCUIT_MIN_CALLS = 3;
+const PROVIDER_CIRCUIT_ERROR_RATE = 0.5;
 
 function globalDailyLimit(env) {
   const raw = env.AI_DAILY_LIMIT;
@@ -75,9 +77,21 @@ export async function runAI(env, task, options = {}) {
   const provs = await providersForTask(env, task);
   const failures = [];
   let quotaSkipped = 0;
+  let circuitSkipped = 0;
 
   for (const p of provs) {
     if (skipped.has(p.name)) continue;
+
+    const health = await env.DB.prepare("SELECT calls,errors FROM ai_usage WHERE day=? AND provider=? AND task=?")
+      .bind(day, p.name, task).first();
+    const providerCalls = Number(health?.calls) || 0;
+    const providerErrors = Number(health?.errors) || 0;
+    if (providerCalls >= PROVIDER_CIRCUIT_MIN_CALLS && providerErrors / providerCalls >= PROVIDER_CIRCUIT_ERROR_RATE) {
+      circuitSkipped++;
+      skipped.add(p.name);
+      addSkip(options, p.name);
+      continue;
+    }
 
     // Réserver d'abord le quota fournisseur; le compteur global est libéré si cette
     // réservation n'aboutit pas. Aucun compteur d'appel n'est gardé sans appel externe.
@@ -112,6 +126,8 @@ export async function runAI(env, task, options = {}) {
   if (failures.length) {
     return { ok: false, reason: `Fournisseurs IA indisponibles : ${failures.join("; ")}`, provider: null };
   }
-  const detail = quotaSkipped ? "quota fournisseur atteint" : "aucun fournisseur activé";
+  const detail = quotaSkipped ? "quota fournisseur atteint"
+    : circuitSkipped ? "fournisseur suspendu après erreurs répétées"
+      : "aucun fournisseur activé";
   return { ok: false, reason: `quota: ${detail} (aucun fournisseur IA disponible)`, provider: null };
 }

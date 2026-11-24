@@ -7,6 +7,7 @@ import { PILLARS, pickService, markServiceUsed, recentPosts, tooSimilar } from "
 
 const PHONE_DEFAULT = "+228 93 39 25 15";
 const BAD = /(\d|fcfa|cfa|€|\$|garanti|témoignage|satisfait|http|www\.)/i;
+const CATALOGUE_URL = "https://risingdigitalsolutions.pages.dev/#catalogue";
 
 // Gabarit de repli ÉLOQUENT : storytelling, bénéfices concrets, appel à l'action.
 // Aucun chiffre, aucun prix, aucune promesse — juste du style.
@@ -14,12 +15,12 @@ export function templatePost(svc, pillarIdx, phone, siteUrl) {
   const descr = String(svc.descr || svc.desc || svc.title);
   const d = descr.charAt(0).toLowerCase() + descr.slice(1);
   const pillars = [
-    `💡 Le numérique, c'est comme un atelier : on avance outil par outil, et chaque outil bien maîtrisé change un quotidien.\n\n✨ Aujourd'hui, parlons de ${svc.title.toLowerCase()} — ${d}\n\nQue vous soyez entrepreneur, commerçant, ONG ou église, il y a toujours une façon plus simple, plus claire et plus professionnelle de faire les choses.`,
-    `🚀 Et si votre activité donnait enfin l'image qu'elle mérite ?\n\n${svc.title} : ${d}\n\nUne image claire attire la confiance. La confiance attire les clients. Et les clients, c'est ce qui fait vivre un projet.`,
-    `👤 Derrière chaque entreprise qui grandit, il y a des outils qui marchent et des messages qui touchent.\n\n✨ ${svc.title}, c'est ${d}\n\nNotre façon de travailler : on écoute d'abord votre réalité, on propose ensuite une solution simple, et on vous accompagne jusqu'à ce que ça marche pour vous.`,
-    `💬 Un projet en tête ? Parlons-en simplement.\n\n✨ ${svc.title} — ${d}\n\nChez Rising Digital Solutions, pas de jargon ni de discours compliqué : on étudie votre besoin, on vous montre ce qui est possible, et le devis ne vient que lorsque tout est clair pour vous.`
+    `💡 Un outil numérique n’est utile que s’il répond à un vrai besoin.\n\nAujourd’hui, focus sur ${svc.title.toLowerCase()} : ${d}\n\nAvant de choisir une solution, clarifiez le résultat recherché, les personnes concernées et les moyens disponibles.`,
+    `Vous souhaitez rendre votre activité plus facile à comprendre en ligne ?\n\n${svc.title} : ${d}\n\nLe bon point de départ : expliquer simplement ce que vous faites et à qui cela s’adresse.`,
+    `Une communication claire commence par une question : que doit comprendre ou pouvoir faire votre public ?\n\nPour ${svc.title.toLowerCase()}, le catalogue présente cette offre : ${d}\n\nChaque projet mérite une réponse adaptée à sa réalité.`,
+    `Vous avez un besoin numérique, mais vous ne savez pas encore quelle solution choisir ?\n\n${svc.title} : ${d}\n\nComparez d’abord les options à votre besoin, votre budget et votre niveau d’autonomie. Un échange de cadrage peut aider à choisir sans engagement.`
   ];
-  const hashtags = "#RisingDigital #Togo #Numérique #Entrepreneuriat";
+  const hashtags = "#RisingDigital #Togo #Numérique";
   const body = `${pillars[pillarIdx % 4]}\n\n${hashtags}`;
   return { text: body, generator: "gabarit" };
 }
@@ -33,17 +34,16 @@ export async function checkFile(env, file) {
   } catch (e) { return "inaccessible : " + e.message; }
 }
 
-const SYSTEM_PROMPT = `Tu es rédacteur publicitaire senior pour Rising Digital Solutions, agence polyvalente de solutions numériques à Agbelouvé (Togo) : création graphique, sites web et applications, IA, formation, maintenance informatique, photographie, sérigraphie, e-commerce, accompagnement des entrepreneurs, ONG et églises.
+const SYSTEM_PROMPT = `Tu es rédacteur de contenus utiles pour Rising Digital Solutions, studio numérique à Agbelouvé (Togo). Le post doit informer ou aider le lecteur avant de présenter un service.
 
 Écris un post Facebook QUI ACCROCHE, en français :
-1. OUVRE avec une phrase qui parle de la réalité vécue (entrepreneur qui débute, boutique qui veut vendre plus, association qui veut se faire connaître) — pas de "Bonjour" ni de "Nous vous proposons".
-2. RAconte le problème en une phrase vivante.
-3. MONTRE ce que le service apporte concrètement, avec des bénéfices tangibles (visibilité, crédibilité, temps gagné, clients touchés).
-4. TERMINE par une invitation chaleureuse à écrire sur WhatsApp pour en discuter (pas de pression, pas de devis imposé).
+1. Ouvre sur un problème réel du public visé, sans dramatiser ni inventer une expérience client.
+2. Donne un conseil concret et directement utile, puis relie-le au service réellement décrit.
+3. Invite sans pression à explorer le catalogue complet; l’URL exacte sera ajoutée par le système.
 
-Style : humain, chaleureux, inspirant, imagé ; phrases courtes qui respirent. Longueur : 80 à 120 mots. 4 émojis maximum, placés naturellement. Termine par 4 hashtags pertinents (dont #RisingDigital et #Togo).
+Style : humain, chaleureux, précis et accessible; 70 à 110 mots; trois émojis maximum et trois hashtags pertinents au plus, dont #RisingDigital et #Togo. Pas de fausse urgence ni de pression.
 
-INTERDIT ABSOLU : chiffres, prix, pourcentages, liens, promesses de résultats garantis, témoignages ou clients inventés, mots anglais inutiles. Réponds UNIQUEMENT avec le texte du post, sans introduction ni commentaire.`;
+INTERDIT ABSOLU : chiffres, prix, pourcentages, liens, promesses de résultats garantis, témoignages ou clients inventés, statistiques non sourcées, faux avis, phrases qui masquent le caractère commercial du post ou manipulation. Réponds UNIQUEMENT avec le texte du post, sans introduction ni commentaire.`;
 
 export async function generatePost(env, tenantId, { manual = false } = {}) {
   const day = manual ? `${utcDay()}T${new Date().toISOString().slice(11, 19)}` : utcDay();
@@ -82,7 +82,7 @@ export async function generatePost(env, tenantId, { manual = false } = {}) {
     text = tpl.text; generator = tpl.generator;
     await log(env, "warn", "repli_gabarit", "IA indisponible ou quota atteint : texte gabarit (éloquent) utilisé", tenantId);
   }
-  const full = `${text}\n\n📱 Écrivez-nous sur WhatsApp : ${phones[0]}\n🌐 ${settings.site_url}`;
+  const full = `${text}\n\n📚 Explorez le catalogue : ${CATALOGUE_URL}\n📱 Pour une orientation, écrivez-nous sur WhatsApp : ${phones[0]}`;
   const status = mode === "auto" ? "approved" : mode === "approval" ? "pending" : "draft";
 
   const r = await env.DB.prepare("INSERT INTO posts(tenant_id,day,title,text,image,status,generator,updated_at) VALUES(?,?,?,?,?,?,?,?)")

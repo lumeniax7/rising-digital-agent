@@ -108,14 +108,20 @@ async function viewPosts(m) {
 
 async function viewWhatsApp(m) {
   const { conversations } = await api("/api/conversations");
-  m.innerHTML = `<h2>Centre WhatsApp</h2><div class="card"><table><tr><th>Contact</th><th>Nom</th><th>Dernier message</th><th>Transféré</th><th></th></tr>${
-    conversations.map(c => `<tr><td>${esc(c.external_id)}</td><td>${esc(c.name || "—")}</td><td>${esc((c.last_msg || "").slice(0, 60))}</td><td>${c.handoff ? "👤 oui" : ""}</td><td><button class="small" data-c="${c.id}">Ouvrir</button></td></tr>`).join("") || '<tr><td colspan="5" class="empty">Aucune conversation — configurez le webhook WhatsApp (voir docs/META-WHATSAPP-SETUP.md)</td></tr>'}</table></div><div id="conv"></div>`;
+  m.innerHTML = `<h2>Centre WhatsApp</h2><div class="card"><table><tr><th>Contact</th><th>Nom</th><th>Dernier message</th><th>État du bot</th><th></th></tr>${
+    conversations.map(c => `<tr><td>${esc(c.external_id)}</td><td>${esc(c.name || "—")}</td><td>${esc((c.last_msg || "").slice(0, 60))}</td><td>${c.handoff ? "Suspendu — intervention humaine" : "Actif"}</td><td><button class="small" data-c="${c.id}">Ouvrir</button></td></tr>`).join("") || '<tr><td colspan="5" class="empty">Aucune conversation — configurez le webhook WhatsApp (voir docs/META-WHATSAPP-SETUP.md)</td></tr>'}</table></div><div id="conv"></div>`;
   m.querySelectorAll("button[data-c]").forEach(b => b.addEventListener("click", () => openConv(b.dataset.c)));
 }
 async function openConv(id) {
-  const { messages } = await api(`/api/conversations/${id}`);
-  $("#conv").innerHTML = `<h3>Conversation #${id}</h3><div class="card chat">${messages.map(x => `<div class="msg ${x.direction}">${fmt(x.body)}</div>`).join("") || '<div class="empty">Aucun message</div>'}
+  const { messages, handoff, customer_stop_requested } = await api(`/api/conversations/${id}`);
+  const paused = handoff ? `<div class="notice" role="status">Le bot est suspendu dans cette conversation. ${customer_stop_requested ? "Le contact a demandé l’arrêt; seul un message explicite « REPRENDRE » envoyé par le contact peut réactiver l’automatisation." : "Si l’échange humain est terminé et que le contact n’a pas demandé l’arrêt, vous pouvez reprendre le bot."}
+      ${customer_stop_requested ? "" : `<button id="resume-bot" class="ghost">Reprendre le bot</button>`}</div>` : `<p class="muted">Votre réponse manuelle suspend automatiquement le bot. La reprise est explicite.</p>`;
+  $("#conv").innerHTML = `<h3>Conversation #${id}</h3><div class="card chat">${paused}${messages.map(x => `<div class="msg ${x.direction}">${fmt(x.body)}</div>`).join("") || '<div class="empty">Aucun message</div>'}
     <form id="rp"><input name="body" placeholder="Votre réponse…" required><button>Envoyer</button></form></div>`;
+  $("#resume-bot")?.addEventListener("click", async () => {
+    try { await api(`/api/conversations/${id}/resume`, { method: "POST" }); toast("Bot repris ✓", "ok"); openConv(id); render(); }
+    catch (err) { toast(err.message, "err"); }
+  });
   $("#rp").addEventListener("submit", async e => { e.preventDefault();
     try { await api(`/api/conversations/${id}/reply`, { method: "POST", body: JSON.stringify({ body: new FormData(e.target).get("body") }) }); toast("Envoyé ✓", "ok"); openConv(id); } catch (err) { toast(err.message, "err"); } });
 }

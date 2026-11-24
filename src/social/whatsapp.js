@@ -1,17 +1,24 @@
 // WhatsApp : réception durable, signature obligatoire et traitement asynchrone réessayable.
 import { graph } from "./meta.js";
+import { sendApprovedWhatsAppTemplate } from "./whatsapp-templates.js";
 import { safeEq, redact } from "../core/util.js";
 import { hmacHex } from "../core/crypto.js";
 import { log } from "../core/log.js";
 import { runAI } from "../ai/router.js";
 import { upsertContact, upsertLead, detectLeadSignal } from "../crm/crm.js";
 import { brandProfile } from "../memory/memory.js";
+import { assertWhatsAppRecipientAllowed, isWhatsAppRecipientBlocked, normalizeWhatsAppRecipient } from "./whatsapp-recipient-policy.js";
 
-const HANDOFF = /(litige|remboursement|plainte|réclamation|parler à (un|une) (humain|personne|agent)|responsable|contrat|paiement direct)/i;
+const HANDOFF = /(litige|remboursement|plainte|réclamation|parler à (un|une) (humain|personne|agent|conseiller)|responsable|contrat|paiement direct|un agent|une personne réelle)/i;
+const OPT_OUT = /(?:^\s*(?:stop|arr[êe]t|unsubscribe|désinscription)\b|\bdésinscris(?:-moi)?\b|\bdésinscrire\b|\bne\s+(?:me\s+)?contact(?:e|ez)?\s+plus\b|\bne\s+m['’]envoyez\s+plus\b|^\s*plus\s+de\s+messages\s*[.!]*\s*$)/i;
+const RESUME = /^\s*(reprendre|start|réactiver|reactiver)\s*[.!]*\s*$/i;
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_MESSAGES = 20;
 const MAX_ATTEMPTS = 5;
 const CLAIM_LEASE_MS = 10 * 60_000;
+const CATALOGUE_URL = "https://risingdigitalsolutions.pages.dev/#catalogue";
+const LEGACY_AI_FALLBACK = "Bonjour 👋 Merci d'avoir contacté Rising Digital Solutions. Décrivez-nous votre besoin en un message : un membre de l'équipe vous répondra personnellement très vite.";
+const AI_FAILURE_NOTICE = "J’ai bien reçu votre message. Mon assistance automatique est momentanément indisponible et je préfère ne pas vous répondre au hasard. Un membre de l’équipe pourra reprendre votre demande.";
 
 function cleanSecret(value) {
   if (typeof value !== "string" || /[\u0000-\u001f\u007f]/.test(value)) return null;
@@ -66,12 +73,16 @@ function extractMessages(data) {
       if (!change || !change.value || typeof change.value !== "object") throw new Error("shape");
       const list = change.value.messages ?? [];
       if (!Array.isArray(list)) throw new Error("shape");
+      const profileByNumber = new Map((Array.isArray(change.value.contacts) ? change.value.contacts : [])
+        .filter(contact => typeof contact?.wa_id === "string" && typeof contact?.profile?.name === "string")
+        .map(contact => [contact.wa_id, contact.profile.name.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 100)]));
       for (const message of list) {
         if (messages.length >= MAX_MESSAGES) throw new Error("limit");
         if (!message || typeof message !== "object" || typeof message.id !== "string" ||
             !/^wamid\.[A-Za-z0-9._=-]{1,500}$/.test(message.id) ||
             typeof message.from !== "string" || !/^\d{5,20}$/.test(message.from)) throw new Error("message");
-        messages.push(message);
+        const profileName = profileByNumber.get(message.from);
+        messages.push(profileName ? { ...message, _profile_name: profileName } : message);
       }
     }
   }
@@ -147,6 +158,21 @@ async function ensureWaSchema(env) {
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT
   )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS wa_template_queue(
+    source_wamid TEXT PRIMARY KEY, tenant_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting_approval' CHECK(status IN ('waiting_approval','processing','sent','failed','skipped')),
+    attempts INTEGER NOT NULL DEFAULT 0, claimed_at TEXT, last_error TEXT, external_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS wa_recipient_blocks(
+    phone_normalized TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT 'owner_request',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS wa_automation_optouts(
+    tenant_id INTEGER NOT NULL, phone_normalized TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY(tenant_id, phone_normalized)
+  )`).run();
 }
 
 function safeErrorText(error, env) {
@@ -205,6 +231,21 @@ export async function processPendingWhatsApp(env, limit = 20) {
   return result;
 }
 
+function isWithinCustomerServiceWindow(message, now = Date.now()) {
+  const seconds = Number(message?.timestamp);
+  if (!Number.isFinite(seconds) || seconds <= 0) return false;
+  const sentAt = seconds * 1000;
+  if (sentAt > now + 5 * 60_000) return false;
+  return now - sentAt < 24 * 3600_000;
+}
+
+async function queueExpiredTemplateReply(env, inbox, tenantId) {
+  await env.DB.prepare(`INSERT OR IGNORE INTO wa_template_queue(source_wamid,tenant_id,status,attempts,created_at)
+    VALUES(?,?,'waiting_approval',0,?)`).bind(inbox.wamid, tenantId, new Date().toISOString()).run();
+  await markCompleted(env, inbox.wamid);
+  await safeLog(env, "info", "wa_template_mis_en_attente", "fenêtre 24 h expirée; aucun envoi lancé", tenantId);
+}
+
 async function processInboxMessage(env, inbox) {
   if (!inbox) throw new Error("Entrée WhatsApp introuvable après réclamation");
   // La persistance du reply et le passage à completed sont atomiques dans D1.
@@ -214,9 +255,14 @@ async function processInboxMessage(env, inbox) {
     return;
   }
   const message = JSON.parse(inbox.payload);
+  if (await isWhatsAppRecipientBlocked(env, message.from)) {
+    await markCompleted(env, inbox.wamid);
+    await safeLog(env, "info", "wa_destinataire_bloque", "réponse supprimée par la politique de blocage", inbox.tenant_id);
+    return;
+  }
   const tenantId = inbox.tenant_id;
-  const text = message.text?.body || message.button?.text || "[message non textuel]";
-  const contactId = await upsertContact(env, tenantId, "whatsapp", message.from);
+  const text = String(message.text?.body || message.button?.text || "[message non textuel]").slice(0, 4000);
+  const contactId = await upsertContact(env, tenantId, "whatsapp", message.from, message._profile_name || null);
   let conv = await env.DB.prepare("SELECT id, handoff FROM conversations WHERE tenant_id=? AND channel='whatsapp' AND contact_id=? ORDER BY id DESC LIMIT 1")
     .bind(tenantId, contactId).first();
   if (!conv) {
@@ -227,10 +273,51 @@ async function processInboxMessage(env, inbox) {
   // Le message entrant peut déjà exister après une reprise : cela ne doit jamais court-circuiter le traitement.
   await env.DB.prepare("INSERT OR IGNORE INTO messages(tenant_id,conversation_id,direction,external_id,body,ts) VALUES(?,?,?,?,?,?)")
     .bind(tenantId, conv.id, "in", message.id, text, new Date(Number(message.timestamp) * 1000 || Date.now()).toISOString()).run();
-  await env.DB.prepare("UPDATE conversations SET last_msg_at=?, handoff=? WHERE id=?")
+  await env.DB.prepare("UPDATE conversations SET last_msg_at=?, handoff=CASE WHEN handoff=1 THEN 1 ELSE ? END WHERE id=?")
     .bind(new Date().toISOString(), conv.handoff || (HANDOFF.test(text) ? 1 : 0), conv.id).run();
 
-  const services = (await env.DB.prepare("SELECT title FROM services WHERE tenant_id=? AND active=1").bind(tenantId).all()).results || [];
+  const phoneNormalized = normalizeWhatsAppRecipient(message.from);
+  if (OPT_OUT.test(text)) {
+    await env.DB.prepare("INSERT OR IGNORE INTO wa_automation_optouts(tenant_id,phone_normalized,created_at) VALUES(?,?,?)")
+      .bind(tenantId, phoneNormalized, new Date().toISOString()).run();
+  }
+  const optedOut = await env.DB.prepare("SELECT 1 AS found FROM wa_automation_optouts WHERE tenant_id=? AND phone_normalized=?")
+    .bind(tenantId, phoneNormalized).first();
+  if (optedOut && RESUME.test(text)) {
+    await env.DB.prepare("DELETE FROM wa_automation_optouts WHERE tenant_id=? AND phone_normalized=?")
+      .bind(tenantId, phoneNormalized).run();
+    await env.DB.prepare("UPDATE conversations SET handoff=0 WHERE id=?").bind(conv.id).run();
+    const acknowledgement = "D’accord, l’assistance automatique reprend. J’ai gardé le fil de nos échanges; dites-moi comment je peux poursuivre.";
+    if (!isWithinCustomerServiceWindow(message)) {
+      await queueExpiredTemplateReply(env, inbox, tenantId);
+      return;
+    }
+    const response = await send(env, message.from, acknowledgement, { automatic: true });
+    await persistReply(env, inbox, tenantId, conv.id, response, acknowledgement);
+    await safeLog(env, "info", "wa_automatisation_reprise_par_contact", `…${message.from.slice(-4)}`, tenantId);
+    return;
+  }
+  if (optedOut) {
+    await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=?").bind(conv.id).run();
+    await markCompleted(env, inbox.wamid);
+    await safeLog(env, "info", "wa_arret_automatique_demande", "réponses automatiques suspendues à la demande du contact", tenantId);
+    return;
+  }
+
+  if (Number(conv.handoff) === 1 && RESUME.test(text)) {
+    await env.DB.prepare("UPDATE conversations SET handoff=0 WHERE id=?").bind(conv.id).run();
+    const acknowledgement = "D’accord, l’assistance automatique reprend. J’ai gardé le fil de nos échanges; dites-moi comment je peux poursuivre.";
+    if (!isWithinCustomerServiceWindow(message)) {
+      await queueExpiredTemplateReply(env, inbox, tenantId);
+      return;
+    }
+    const response = await send(env, message.from, acknowledgement, { automatic: true });
+    await persistReply(env, inbox, tenantId, conv.id, response, acknowledgement);
+    await safeLog(env, "info", "wa_automatisation_reprise_par_contact", `…${message.from.slice(-4)}`, tenantId);
+    return;
+  }
+
+  const services = (await env.DB.prepare("SELECT title,descr FROM services WHERE tenant_id=? AND active=1 ORDER BY title").bind(tenantId).all()).results || [];
   const signal = detectLeadSignal(text, services);
   if (signal.hasNeed) {
     await upsertLead(env, tenantId, contactId, { service: signal.service, need: text.slice(0, 500), urgency: signal.urgency });
@@ -238,12 +325,37 @@ async function processInboxMessage(env, inbox) {
   }
 
   if (HANDOFF.test(text)) {
+    const alreadyHandedOff = Number(conv.handoff) === 1;
     await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=?").bind(conv.id).run();
     await upsertLead(env, tenantId, contactId, { status: "à traiter par un humain" });
-    const reply = "Merci pour votre message 🙏 Ce point demande l'attention d'un membre de l'équipe : il vous répondra personnellement très vite.";
-    const response = await send(env, message.from, reply);
+    if (alreadyHandedOff) {
+      await markCompleted(env, inbox.wamid);
+      await safeLog(env, "info", "wa_transfert_humain_en_attente", "transfert déjà actif; accusé supplémentaire supprimé", tenantId);
+      return;
+    }
+    if (!isWithinCustomerServiceWindow(message)) {
+      await queueExpiredTemplateReply(env, inbox, tenantId);
+      return;
+    }
+    const reply = "Merci pour votre message. Ce point demande l’attention d’un membre de l’équipe; votre demande est transmise pour reprise humaine.";
+    const response = await send(env, message.from, reply, { automatic: true });
     await persistReply(env, inbox, tenantId, conv.id, response, reply);
     await safeLog(env, "info", "wa_transfert_humain", `contact …${message.from.slice(-4)}`, tenantId);
+    return;
+  }
+
+  if (conv.handoff) {
+    await markCompleted(env, inbox.wamid);
+    await safeLog(env, "info", "wa_transfert_humain_en_attente", "réponse automatique suspendue pendant le transfert humain", tenantId);
+    return;
+  }
+  const priorNotice = await env.DB.prepare(`SELECT 1 AS found FROM messages
+    WHERE conversation_id=? AND direction='out' AND body IN (?,?) LIMIT 1`)
+    .bind(conv.id, LEGACY_AI_FALLBACK, AI_FAILURE_NOTICE).first();
+  if (priorNotice) {
+    await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=?").bind(conv.id).run();
+    await markCompleted(env, inbox.wamid);
+    await safeLog(env, "info", "wa_transfert_humain_en_attente", "ancien avis de repli détecté; réponses automatiques suspendues", tenantId);
     return;
   }
 
@@ -258,14 +370,49 @@ async function processInboxMessage(env, inbox) {
     }
   }
 
+  if (!isWithinCustomerServiceWindow(message)) {
+    await queueExpiredTemplateReply(env, inbox, tenantId);
+    return;
+  }
+
   const brand = await brandProfile(env, tenantId);
-  const history = (await env.DB.prepare("SELECT direction, body FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 6").bind(conv.id).all()).results.reverse();
-  const system = `Tu es l'assistant de Rising Digital Solutions (Agbelouvé, Togo), prestataire polyvalent de solutions, services, création et formation numériques (sites web, IA, graphisme, formation, maintenance, impression, e-commerce). Règles : réponds en français, court (80 mots max), chaleureux et concret ; ne promets JAMAIS de prix, de délais précis, de résultats garantis ; si la demande est complexe, sensible ou commerciale avancée, invite à parler à un membre de l'équipe ; propose la visite du site. Profil de marque :\n${brand}`;
+  const serviceFacts = services.map(service => `- ${service.title} : ${String(service.descr || "").slice(0, 240)}`).join("\n");
+  const history = (await env.DB.prepare("SELECT direction, body FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 12").bind(conv.id).all()).results.reverse();
+  const system = `Tu es l’assistant virtuel de Rising Digital Solutions, studio numérique basé à Agbelouvé (Togo). Tu aides le fondateur à répondre avec un ton professionnel, chaleureux, naturel et direct. Ne prétends jamais être le fondateur ou une personne humaine, et ne prétends jamais avoir fait une action qui n’est pas confirmée.
+
+Réponds d’abord à la demande réelle. Suis le fil logique des 12 derniers échanges, ne redemande pas une information déjà donnée et ne répète pas une salutation. Sois utile, calme, précis et proportionné. Pose au plus une question ciblée si un élément nécessaire manque. Si la personne expose un besoin, résume-le brièvement, propose au plus un service pertinent du catalogue, puis partage le lien du catalogue seulement si cela aide réellement. La prospection doit rester transparente, non insistante et clairement commerciale quand elle l’est; n’utilise ni pression, ni urgence artificielle, ni tactique destinée à cacher l’intention de vente. Si la personne refuse une proposition, n’insiste pas.
+
+Utilise uniquement les faits vérifiés ci-dessous. Les services et descriptions sont connus; les tarifs, délais, disponibilités, garanties, conditions et résultats ne le sont pas ici. N’en invente aucun. Pour les questions sensibles, engagements importants ou données absentes, explique brièvement la limite et propose une reprise humaine. Réponds en français, généralement en moins de 120 mots. Le lien exact du catalogue est ${CATALOGUE_URL}.
+
+Profil de marque :
+${brand}
+
+Catalogue vérifié :
+${serviceFacts || "Aucune offre active vérifiée; ne prétends pas connaître le catalogue."}`;
   const msgs = [{ role: "system", content: system }, ...history.map(item => ({ role: item.direction === "in" ? "user" : "assistant", content: item.body }))];
-  const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 300 });
-  const reply = ai.ok ? ai.text.slice(0, 1200)
-    : "Bonjour 👋 Merci d'avoir contacté Rising Digital Solutions. Décrivez-nous votre besoin en un message : un membre de l'équipe vous répondra personnellement très vite.";
-  const response = await send(env, message.from, reply);
+  const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 400 });
+  if (!ai.ok || !String(ai.text || "").trim()) {
+    const handoffClaim = await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=? AND handoff=0").bind(conv.id).run();
+    if (!(handoffClaim.meta?.changes > 0)) {
+      await markCompleted(env, inbox.wamid);
+      await safeLog(env, "warn", "wa_ia_indisponible_sans_reponse", "transfert humain déjà actif; avis supplémentaire supprimé", tenantId);
+      return;
+    }
+    const response = await send(env, message.from, AI_FAILURE_NOTICE, { automatic: true });
+    await persistReply(env, inbox, tenantId, conv.id, response, AI_FAILURE_NOTICE);
+    await safeLog(env, "warn", "wa_ia_indisponible_transfert_humain", "aucune réponse générée; transfert humain requis", tenantId);
+    return;
+  }
+  const latestHandoff = await env.DB.prepare("SELECT handoff FROM conversations WHERE id=?").bind(conv.id).first();
+  if (Number(latestHandoff?.handoff) === 1) {
+    await markCompleted(env, inbox.wamid);
+    await safeLog(env, "info", "wa_reponse_ia_annulee", "transfert humain activé pendant la génération", tenantId);
+    return;
+  }
+  const hasPreviousReply = history.some(item => item.direction === "out");
+  const disclosure = hasPreviousReply ? "" : "Je suis l’assistant virtuel de Rising Digital Solutions. ";
+  const reply = `${disclosure}${ai.text.trim()}`.slice(0, 1200);
+  const response = await send(env, message.from, reply, { automatic: true });
   await persistReply(env, inbox, tenantId, conv.id, response, reply);
   await safeLog(env, "info", "wa_reponse_envoyee", `…${message.from.slice(-4)} ${ai.ok ? "via " + ai.provider : "(repli statique)"}`, tenantId);
 }
@@ -287,7 +434,9 @@ async function persistReply(env, inbox, tenantId, conversationId, response, text
   ]);
 }
 
-export async function send(env, to, body) {
+export async function send(env, to, body, { automatic = false } = {}) {
+  // La garde immédiate est réservée aux automatisations; l’envoi manuel reste possible.
+  if (automatic) await assertWhatsAppRecipientAllowed(env, to);
   const token = cleanSecret(env.WA_TOKEN);
   if (!token) throw new Error("WhatsApp non configuré");
   const phoneId = cleanSecret(env.WA_PHONE_ID);

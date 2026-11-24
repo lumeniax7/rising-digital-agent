@@ -1,12 +1,13 @@
 // Rising Digital Agent v4 — point d'entrée.
 // Routes : /webhook (WhatsApp), /api/* (tableau de bord authentifié), / (SPA statique), /health.
 import { handleWhatsApp, processPendingWhatsApp } from "./social/whatsapp.js";
+import { processWhatsAppTemplateQueue } from "./social/whatsapp-template-queue.js";
 import { handleApi } from "./web/router.js";
 import { ensure } from "./core/db.js";
 import { log } from "./core/log.js";
 import { generatePost } from "./content/generator.js";
 import { runDue, enqueue } from "./tasks/queue.js";
-import { dailyReport } from "./reports/reports.js";
+import { dailyReport, monitorWhatsAppQueue } from "./reports/reports.js";
 import { getMode } from "./core/config.js";
 import { nowISO } from "./core/util.js";
 import { publishDue } from "./social/publish.js";
@@ -43,6 +44,8 @@ export default {
         await log(env, "info", "cron_debut", `cron=${event.cron}`, tid);
         if (event.cron === "*/15 * * * *") {
           await processPendingWhatsApp(env, 20);
+          await processWhatsAppTemplateQueue(env, 20);
+          await monitorWhatsAppQueue(env);
           await publishDue(env, tid, 3);
           return;
         }
