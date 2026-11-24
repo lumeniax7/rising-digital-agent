@@ -39,4 +39,4 @@ npm test    # node --test : machine à états, anti-répétition, webhook WhatsA
 Cloudflare Workers (API + cron) · D1 (données, isolation par client) · Workers AI (routeur multi-fournisseurs + quotas + repli) · assets statiques (SPA + 27 affiches). Détails : `docs/ARCHITECTURE.md`.
 
 ## Sécurité
-Aucun secret dans le code, GitHub ou les journaux (masquage systématique). Sessions PBKDF2 + CSRF + rate limiting. `.dev.vars` ignoré par Git. Voir `docs/VARIABLES.md`.
+Les secrets applicatifs restent dans Cloudflare Worker. Workers Builds publie depuis `main` après ses tests; GitHub Actions ne lance que les tests et ne requiert pas de jeton Cloudflare pour cette configuration. Aucun secret n’est committé ni écrit dans les journaux. Sessions PBKDF2 + CSRF + rate limiting. `.dev.vars` ignoré par Git. Voir `docs/VARIABLES.md`.
