@@ -7,6 +7,7 @@ import { log } from "./core/log.js";
 import { generatePost } from "./content/generator.js";
 import { runDue, enqueue } from "./tasks/queue.js";
 import { dailyReport } from "./reports/reports.js";
+import { processDueFollowups } from "./social/conversation.js";
 import { getMode } from "./core/config.js";
 import { nowISO } from "./core/util.js";
 
@@ -48,6 +49,8 @@ export default {
         try { await generatePost(env, tid); } catch (e) { await log(env, "error", "generation_echec", e.message, tid); }
         await enqueue(env, "publish_posts", {}, `publish_${nowISO().slice(0, 13)}`);
         try { await runDue(env); } catch (e) { await log(env, "error", "publication_cron_echec", e.message, tid); }
+        // Relances WhatsApp arrivées à échéance (fenêtre 24 h respectée, jamais d'envoi libre au-delà).
+        try { await processDueFollowups(env); } catch (e) { await log(env, "error", "relances_cron_echec", e.message, tid); }
         await env.DB.prepare("DELETE FROM events WHERE ts<datetime('now','-30 days')").run();
         await env.DB.prepare("DELETE FROM wa_seen WHERE ts<datetime('now','-7 days')").run();
         await env.DB.prepare("DELETE FROM rate_limit WHERE window_start<datetime('now','-1 day')").run();

@@ -6,6 +6,7 @@ import { log } from "../core/log.js";
 import { runAI } from "../ai/router.js";
 import { upsertContact, upsertLead, detectLeadSignal } from "../crm/crm.js";
 import { brandProfile } from "../memory/memory.js";
+import { classifyMessage, buildSystemPrompt, shouldReply, nextFollowupDelayH, cancelScheduledFollowups, scheduleFollowup } from "./conversation.js";
 
 const HANDOFF = /(litige|remboursement|plainte|réclamation|parler à (un|une) (humain|personne|agent)|responsable|contrat|paiement direct)/i;
 const MAX_BODY_BYTES = 256 * 1024;
@@ -237,6 +238,19 @@ async function processInboxMessage(env, inbox) {
     await safeLog(env, "info", "prospect_enregistre", `contact #${contactId}`, tenantId);
   }
 
+  // Relances (v4.1) : la personne vient de répondre -> la relance en attente devient obsolète ;
+  // on la remplace par une nouvelle, calibrée selon l'intention détectée. Non bloquant :
+  // un échec de programmation n'empêche jamais la réponse au message.
+  const classification = classifyMessage(text);
+  try {
+    await cancelScheduledFollowups(env, conv.id);
+    const delayH = nextFollowupDelayH(classification.intent, signal.hasNeed);
+    if (delayH && !conv.handoff) {
+      await scheduleFollowup(env, { tenantId, contactId, conversationId: conv.id, angle: classification.service || null, dueAt: new Date(Date.now() + delayH * 3600_000).toISOString() });
+      await safeLog(env, "info", "relance_programmee", `contact #${contactId} dans ${delayH}h (intent=${classification.intent})`, tenantId);
+    }
+  } catch (e) { await safeLog(env, "warn", "relance_programmation_echec", e, tenantId); }
+
   if (HANDOFF.test(text)) {
     await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=?").bind(conv.id).run();
     await upsertLead(env, tenantId, contactId, { status: "à traiter par un humain" });
@@ -251,7 +265,9 @@ async function processInboxMessage(env, inbox) {
   if (cooldown > 0) {
     const last = await env.DB.prepare("SELECT ts FROM messages WHERE tenant_id=? AND conversation_id=? AND direction='out' ORDER BY id DESC LIMIT 1")
       .bind(tenantId, conv.id).first();
-    if (last && Date.now() - new Date(last.ts).getTime() < cooldown * 3600_000) {
+    // Anti-spam v4.1 : les messages sans enjeu suivent le délai historique ; une vraie
+    // question ou un besoin reçoit une réponse dès 20 min d'écart (jamais une boucle).
+    if (!shouldReply({ lastOutTs: last ? new Date(last.ts).getTime() : null, cooldownH: cooldown, intent: classification.intent, hasNeed: signal.hasNeed })) {
       await markCompleted(env, inbox.wamid);
       await safeLog(env, "info", "wa_delai_anti_spam", `…${message.from.slice(-4)}`, tenantId);
       return;
@@ -260,7 +276,10 @@ async function processInboxMessage(env, inbox) {
 
   const brand = await brandProfile(env, tenantId);
   const history = (await env.DB.prepare("SELECT direction, body FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 6").bind(conv.id).all()).results.reverse();
-  const system = `Tu es l'assistant de Rising Digital Solutions (Agbelouvé, Togo), prestataire polyvalent de solutions, services, création et formation numériques (sites web, IA, graphisme, formation, maintenance, impression, e-commerce). Règles : réponds en français, court (80 mots max), chaleureux et concret ; ne promets JAMAIS de prix, de délais précis, de résultats garantis ; si la demande est complexe, sensible ou commerciale avancée, invite à parler à un membre de l'équipe ; propose la visite du site. Profil de marque :\n${brand}`;
+  const system = buildSystemPrompt({
+    brand, services: services.map(s => s.title), classification,
+    siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`,
+  });
   const msgs = [{ role: "system", content: system }, ...history.map(item => ({ role: item.direction === "in" ? "user" : "assistant", content: item.body }))];
   const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 300 });
   const reply = ai.ok ? ai.text.slice(0, 1200)

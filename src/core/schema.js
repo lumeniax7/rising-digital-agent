@@ -64,5 +64,12 @@ export const SCHEMA = [
      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed')),
      attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT, last_error TEXT, claimed_at TEXT,
      reply_external_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT)`,
-  "CREATE INDEX IF NOT EXISTS idx_wa_inbox_due ON wa_inbox(status, next_attempt_at, claimed_at)"
+  "CREATE INDEX IF NOT EXISTS idx_wa_inbox_due ON wa_inbox(status, next_attempt_at, claimed_at)",
+  `CREATE TABLE IF NOT EXISTS followups(
+     id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+     contact_id INTEGER NOT NULL REFERENCES contacts(id), conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+     angle TEXT, status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled','sent','cancelled','template_required','failed')),
+     due_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')), sent_at TEXT, updated_at TEXT)`,
+  "CREATE INDEX IF NOT EXISTS idx_followups_due ON followups(status, due_at)"
 ];
