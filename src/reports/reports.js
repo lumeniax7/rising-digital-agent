@@ -92,3 +92,44 @@ async function maybeNotify(env, content) {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
   } catch (e) { await log(env, "warn", "notification_echec", e.message); }
 }
+
+// ---- v4.3.2 : résumé individuel par conversation, envoyé à l'admin (matin + soir) ----
+
+// Construction PURE (testable) du bloc résumé : une ligne par conversation active,
+// avec dernier message, statut du prospect et action suggérée (heuristique honnête).
+export function buildDigestBlock(rows) {
+  if (!rows.length) return null;
+  const lines = rows.map(r => {
+    const action = r.handoff ? "👉 traiter en priorité (demande humain)"
+      : (r.recv > r.sent && ["nouveau", null].includes(r.lead_status)) ? "👉 à recontacter : besoin exprimé sans réponse d'équipe"
+      : (r.lead_status && !["gagné", "perdu"].includes(r.lead_status)) ? "👀 surveiller / préparer une proposition"
+      : "✓ suivre normalement";
+    const last = r.last_msg ? String(r.last_msg).replace(/\s+/g, " ").slice(0, 120) : "(vide)";
+    const lead = r.lead_status ? `${r.lead_status}${r.lead_service ? ` — ${r.lead_service}` : ""}` : "aucun";
+    return `📞 +${r.external_id} — ${r.recv} reçu(s) / ${r.sent} envoyé(s)\n   Prospect : ${lead}\n   Dernier message : « ${last} »\n   ${action}`;
+  });
+  return lines.join("\n");
+}
+
+export async function conversationDigest(env, tenantId, sinceHours, label) {
+  const since = `-${sinceHours} hours`;
+  const rows = (await env.DB.prepare(
+    `SELECT c.id, ct.external_id, ct.name, c.handoff,
+      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.direction='in' AND m.ts>datetime('now',?)) recv,
+      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id AND m.direction='out' AND m.ts>datetime('now',?)) sent,
+      (SELECT body FROM messages m WHERE m.conversation_id=c.id AND m.direction='in' ORDER BY id DESC LIMIT 1) last_msg,
+      (SELECT status FROM leads l WHERE l.contact_id=c.contact_id AND l.tenant_id=c.tenant_id ORDER BY id DESC LIMIT 1) lead_status,
+      (SELECT service FROM leads l WHERE l.contact_id=c.contact_id AND l.tenant_id=c.tenant_id ORDER BY id DESC LIMIT 1) lead_service
+     FROM conversations c JOIN contacts ct ON ct.id=c.contact_id
+     WHERE c.tenant_id=? AND c.last_msg_at>datetime('now',?) ORDER BY c.last_msg_at DESC LIMIT 30`)
+    .bind(since, since, tenantId, since).all()).results || [];
+  const block = buildDigestBlock(rows);
+  const content = block
+    ? `📋 ${label} — ${rows.length} conversation(s) active(s) sur ${sinceHours} h\n\n${block}\n\n— Rising Digital Agent`
+    : `📋 ${label} — aucune conversation active sur les ${sinceHours} dernières heures.`;
+  await env.DB.prepare("INSERT INTO reports(tenant_id,kind,day,content) VALUES(?,?,?,?,?) ON CONFLICT(tenant_id,kind,day) DO UPDATE SET content=excluded.content")
+    .bind(tenantId, `digest_${label.toLowerCase().split(" ")[0]}`, utcDay(), content).run();
+  const { notifyAdmin } = await import("../social/alerts.js");
+  await notifyAdmin(env, content);
+  return rows.length;
+}

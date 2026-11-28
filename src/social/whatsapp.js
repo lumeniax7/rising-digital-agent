@@ -218,7 +218,29 @@ async function processInboxMessage(env, inbox) {
   }
   const message = JSON.parse(inbox.payload);
   const tenantId = inbox.tenant_id;
-  const text = message.text?.body || message.button?.text || "[message non textuel]";
+  let text = message.text?.body || message.button?.text || null;
+  // v4.3.2 : les messages VOCaux sont transcrits (Workers AI Whisper, multilingue).
+  // Honnêteté absolue : si la transcription échoue ou est illisible, on le DIT et on
+  // demande de renvoyer/écrire — jamais d'interprétation inventée.
+  let voice = false;
+  if (!text && message.type === "audio" && message.audio?.id) {
+    voice = true;
+    try {
+      const tr = await transcribeAudio(env, message.audio.id);
+      if (tr && tr.length >= 2) text = tr;
+    } catch (e) { await safeLog(env, "warn", "wa_vocal_transcription_echec", e, tenantId); }
+  }
+  if (!text) {
+    const reply = voice
+      ? "Je n'ai pas réussi à écouter votre message vocal correctement 🙏 Pouvez-vous le renvoyer, ou m'écrire votre demande en texte ? Comme ça je suis sûr de bien vous comprendre."
+      : "Merci pour votre message 🙏 Pour l'instant je ne peux lire que du texte : décrivez-moi votre besoin en quelques mots et je vous oriente tout de suite.";
+    const response = await send(env, message.from, reply);
+    await persistReply(env, inbox, tenantId, conv.id, response, reply);
+    await markCompleted(env, inbox.wamid);
+    await safeLog(env, "info", "wa_message_non_textuel", `…${message.from.slice(-4)} type=${message.type}`, tenantId);
+    return;
+  }
+  if (voice) text = `[vocal] ${text}`;
   const contactId = await upsertContact(env, tenantId, "whatsapp", message.from);
   let conv = await env.DB.prepare("SELECT id, handoff FROM conversations WHERE tenant_id=? AND channel='whatsapp' AND contact_id=? ORDER BY id DESC LIMIT 1")
     .bind(tenantId, contactId).first();
@@ -300,10 +322,11 @@ async function processInboxMessage(env, inbox) {
   const brand = await brandProfile(env, tenantId);
   // Brèves de contexte du jour (v4.3) : générées une fois le matin, réutilisées toute la journée.
   const briefing = parseBriefing((await env.DB.prepare("SELECT v FROM meta WHERE k='briefing_du_jour'").first().catch(() => null))?.v);
-  const history = (await env.DB.prepare("SELECT direction, body FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 6").bind(conv.id).all()).results.reverse();
+  const history = (await env.DB.prepare("SELECT direction, body FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 8").bind(conv.id).all())
+    .results.filter(h => !String(h.body || "").startsWith("[image]")).slice(-6).reverse();
   const system = buildSystemPrompt({
     brand, services: services.map(s => s.title), classification,
-    siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`, contactProfile, briefing,
+    siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`, contactProfile, briefing, voice,
   });
   const msgs = [{ role: "system", content: system }, ...history.map(item => ({ role: item.direction === "in" ? "user" : "assistant", content: item.body }))];
   const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 300 });
@@ -358,6 +381,22 @@ async function persistReply(env, inbox, tenantId, conversationId, response, text
     env.DB.prepare("UPDATE wa_inbox SET status='completed',reply_external_id=?,next_attempt_at=NULL,last_error=NULL,claimed_at=NULL,updated_at=? WHERE wamid=? AND status='processing'")
       .bind(externalId, timestamp, inbox.wamid),
   ]);
+}
+
+// Transcription d'un vocal WhatsApp : URL média via Graph, téléchargement authentifié,
+// puis Workers AI (Whisper). Lève une erreur explicite en cas d'échec — jamais de faux texte.
+async function transcribeAudio(env, mediaId) {
+  const token = cleanSecret(env.WA_TOKEN);
+  if (!token) throw new Error("WhatsApp non configuré");
+  const meta = await graph(env, "GET", `/${mediaId}`, null, token);
+  if (!meta?.url) throw new Error("média vocal introuvable");
+  const r = await fetch(meta.url, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error(`téléchargement vocal HTTP ${r.status}`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  if (!bytes.length) throw new Error("vocal vide");
+  if (bytes.length > 16 * 1024 * 1024) throw new Error("vocal trop long (>16 Mo)");
+  const ai = await runAI(env, "transcribe", { audio: bytes, max_tokens: 512 });
+  return String(ai.text || "").trim();
 }
 
 export async function send(env, to, body) {

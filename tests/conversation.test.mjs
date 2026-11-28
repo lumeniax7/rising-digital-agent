@@ -29,8 +29,9 @@ test("shouldReply : question réelle répondue rapidement, bruit toujours filtr�
   assert.equal(shouldReply({ lastOutTs: null }), true);
   // Question réelle après 30 min : on répond même si le cooldown est de 6 h.
   assert.equal(shouldReply({ lastOutTs: now - 0.5 * HOUR, cooldownH: 6, intent: "prix_delai", hasNeed: false, now }), true);
-  // Boucle à répétition (< 20 min) : bloquée.
-  assert.equal(shouldReply({ lastOutTs: now - 5 * 60_000, cooldownH: 6, intent: "prix_delai", hasNeed: true, now }), false);
+  // v4.3.2 : seule une rafale < 3 min est bloquée (anti-boucle) ; 5 min = réponse normale.
+  assert.equal(shouldReply({ lastOutTs: now - 5 * 60_000, cooldownH: 6, intent: "prix_delai", hasNeed: true, now }), true);
+  assert.equal(shouldReply({ lastOutTs: now - 60_000, cooldownH: 6, intent: "prix_delai", hasNeed: true, now }), false);
   // Bruit sans enjeu : ancien comportement (cooldown complet).
   assert.equal(shouldReply({ lastOutTs: now - 2 * HOUR, cooldownH: 6, intent: "autre_inconnu", hasNeed: false, now }), false);
   assert.equal(shouldReply({ lastOutTs: now - 7 * HOUR, cooldownH: 6, intent: "autre_inconnu", hasNeed: false, now }), true);
@@ -94,4 +95,29 @@ test("rapport v4.3.1 : ligne publications par canal sans double comptage", async
   assert.match(line, /jeton expiré/);           // l'erreur brute est citée : actionnable
   const clean = publicationLine("Publications —", { facebook: { ok: 2, echecs: 0, dernier_erreur: null }, instagram: { ok: 2, echecs: 0, dernier_erreur: null } });
   assert.ok(!clean.includes("dernier échec"));  // pas d'alerte quand tout va bien
+});
+
+test("BUG v4.2 corrigé : un client revenant après 24h+ reçoit une réponse", () => {
+  const now = Date.now();
+  // Avant le correctif, gapH < 24 rendait le bot muet — interdit désormais.
+  assert.equal(shouldReply({ lastOutTs: now - 30 * 3600_000, cooldownH: 6, intent: "prix_delai", now }), true);
+  assert.equal(shouldReply({ lastOutTs: now - 3 * 24 * 3600_000, cooldownH: 6, intent: "question_generale", now }), true);
+  // Boucle instantanée toujours bloquée (3 min d'écart minimal).
+  assert.equal(shouldReply({ lastOutTs: now - 60_000, cooldownH: 6, intent: "prix_delai", now }), false);
+});
+
+test("digest individuel : format par numéro, action suggérée, jamais de fabrication", async () => {
+  const { buildDigestBlock } = await import("../src/reports/reports.js");
+  const rows = [
+    { external_id: "22896449300", recv: 3, sent: 0, last_msg: "je veux un site pour ma boutique", lead_status: "nouveau", lead_service: "Création de site et application", handoff: 0 },
+    { external_id: "22890000001", recv: 1, sent: 1, last_msg: "parler à un humain", lead_status: "à traiter par un humain", lead_service: null, handoff: 1 },
+  ];
+  const block = buildDigestBlock(rows);
+  assert.match(block, /\+22896449300/);
+  assert.match(block, /3 reçu\(s\) \/ 0 envoyé\(s\)/);
+  assert.match(block, /Création de site et application/);
+  assert.match(block, /à recontacter/);
+  assert.match(block, /traiter en priorité/);
+  assert.match(block, /je veux un site pour ma boutique/);
+  assert.equal(buildDigestBlock([]), null);
 });

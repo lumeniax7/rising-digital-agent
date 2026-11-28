@@ -6,7 +6,7 @@ import { ensure } from "./core/db.js";
 import { log } from "./core/log.js";
 import { generatePost } from "./content/generator.js";
 import { runDue, enqueue } from "./tasks/queue.js";
-import { dailyReport } from "./reports/reports.js";
+import { dailyReport, conversationDigest } from "./reports/reports.js";
 import { processDueFollowups } from "./social/conversation.js";
 import { generateBriefing } from "./content/briefing.js";
 import { prepareDailyStatuses } from "./content/statuts.js";
@@ -43,8 +43,13 @@ export default {
       try {
         const tid = await ensure(env);
         await log(env, "info", "cron_debut", `cron=${event.cron}`, tid);
-        if (event.cron === "30 7 * * *") {           // 07h30 Lomé : rapport quotidien (et hebdo le lundi)
+        if (event.cron === "30 7 * * *") {           // 07h30 Lomé : rapport quotidien + digest individuel du matin (24 h)
           await dailyReport(env);
+          try { await conversationDigest(env, tid, 24, "Résumé du matin (24 h)"); } catch (e) { await log(env, "error", "digest_matin_echec", e.message, tid); }
+          return;
+        }
+        if (event.cron === "0 19 * * *") {           // 19h00 Lomé : digest individuel du soir (12 h)
+          try { await conversationDigest(env, tid, 12, "Résumé du soir (12 h)"); } catch (e) { await log(env, "error", "digest_soir_echec", e.message, tid); }
           return;
         }
         if (event.cron === "0 16 * * *") {           // 16h00 Lomé : second post quotidien (visibilité doublée)

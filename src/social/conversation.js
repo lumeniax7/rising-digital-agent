@@ -96,7 +96,7 @@ const STRATEGIES = {
  * Prompt système enrichi : sujet variés autorisés, objectif de conversion constant, honnêteté stricte.
  * Remplace l'ancien prompt figé sans toucher au reste du flux (handoff, CRM, anti-spam).
  */
-export function buildSystemPrompt({ brand, services = [], classification = {}, siteUrl, phone, contactProfile = null, briefing = null } = {}) {
+export function buildSystemPrompt({ brand, services = [], classification = {}, siteUrl, phone, contactProfile = null, briefing = null, voice = false } = {}) {
   const c = classification;
   const catalogue = services.length ? `Catalogue réel (ne cite que ces services, sans en inventer) : ${services.join(" ; ")}.` : "";
   const pont = c.service
@@ -117,7 +117,8 @@ ${STRATEGIES[c.intent] || STRATEGIES.question_generale}
 ${contactProfile
     ? `MÉMOIRE DE CET INTERLOCUTEUR : sujets déjà abordés : ${(contactProfile.sujets || []).join(", ") || "aucun"}${contactProfile.dernier_besoin ? ` ; dernier besoin exprimé : « ${contactProfile.dernier_besoin} »` : ""}. Ne repose pas une question dont tu connais déjà la réponse : repars de son dernier besoin et continue la discussion.`
     : `C'est probablement un premier échange : pose une question ouverte pour découvrir son besoin.`}
-${briefing ? `BRIÈVES DE CONTEXTE DU JOUR (vérifiées, tu peux t'en inspirer — ne les recopie pas mot pour mot) :\n${briefing}` : ""}
+${voice ? `MESSAGE VOCAL TRANSCRIT AUTOMATIQUEMENT : la transcription peut contenir des ERREURS (mots mal entendus, passages manquants, langue mal reconnue). Règles : réponds dans la langue du message transcrit si elle est identifiable (français par défaut) ; si un passage est ambigu, incomplet ou douteux, demande HONNÊTEMENT à la personne de répéter ou préciser CETTE PARTIE précise — n'interprète jamais, ne devine jamais, ne réponds jamais sur une hypothèse.
+` : ""}${briefing ? `BRIÈVES DE CONTEXTE DU JOUR (vérifiées, tu peux t'en inspirer — ne les recopie pas mot pour mot) :\n${briefing}` : ""}
 
 ${pont}
 ${catalogue}
@@ -134,13 +135,17 @@ ${brand || "Profil de marque non renseigné."}`;
  * Amélioration : une vraie question ou un besoin obtient une réponse dès que l'écart minimal
  * (20 min par défaut) est respecté — on n'ignore plus un client pendant 6 heures.
  */
-export function shouldReply({ lastOutTs, cooldownH = 0, intent = "question_generale", hasNeed = false, minGapMin = 20, now = Date.now() } = {}) {
+export function shouldReply({ lastOutTs, cooldownH = 0, intent = "question_generale", hasNeed = false, minGapMin = 3, now = Date.now() } = {}) {
   if (!lastOutTs) return true;
   const gapH = (now - lastOutTs) / 3600_000;
   const gapMin = (now - lastOutTs) / 60_000;
   const engages = hasNeed || ["prix_delai", "besoin_service", "conseil", "question_generale", "report", "refus", "salutation"].includes(intent);
   if (!engages) return gapH >= cooldownH;           // bavardage/bruit : ancien comportement conservé
-  return gapMin >= minGapMin && gapH < 24;          // question réelle : réponse rapide, boucle bloquée
+  // BUG v4.2 corrigé : l'ancienne condition "gapH < 24" rendait le bot MUET pour tout
+  // client qui revenait plus de 24h après le dernier message du bot — c'était la panne
+  // constatée. Désormais une vraie question a TOUJOURS une réponse ; seul l'écart minimal
+  // (3 min) protège des boucles de messages instantanées.
+  return gapMin >= minGapMin;
 }
 
 /**

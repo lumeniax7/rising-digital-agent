@@ -3,7 +3,7 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 
 [triggers]
-crons = ["0 7 * * *", "30 7 * * *", "0 16 * * *", "*/15 * * * *"]   # 07h00 briefing+statuts+post, 07h30 rapport, 16h00 2e post, reprises toutes les 15 min
+crons = ["0 7 * * *", "30 7 * * *", "0 16 * * *", "0 19 * * *", "*/15 * * * *"]   # 07h00 briefing+statuts+post, 07h30 rapport, 16h00 2e post, reprises toutes les 15 min
 
 [ai]
 binding = "AI"
