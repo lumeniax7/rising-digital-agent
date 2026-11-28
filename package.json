@@ -1,0 +1,16 @@
+{
+  "name": "rising-digital-agent",
+  "version": "4.0.0",
+  "description": "Agent IA autonome de Rising Digital Solutions (Togo) : publications sociales, assistant WhatsApp, CRM, rapports — 100% Cloudflare gratuit.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --keep-vars",
+    "db:init": "wrangler d1 execute rds-agent --remote --file=migrations/0001_init.sql && wrangler d1 execute rds-agent --remote --file=migrations/0002_wa_inbox.sql",
+    "db:init:local": "wrangler d1 execute rds-agent --local --file=migrations/0001_init.sql && wrangler d1 execute rds-agent --local --file=migrations/0002_wa_inbox.sql"
+  },
+  "devDependencies": { "wrangler": "^4.0.0" },
+  "engines": { "node": ">=20" }
+}
