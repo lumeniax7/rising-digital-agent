@@ -99,14 +99,46 @@ const STRATEGIES = {
 /**
  * Prompt système : conseiller conversationnel d'abord, conseiller commercial seulement si pertinent.
  * Le classement local sert de contexte, jamais de formulaire ni de limite aux sujets possibles.
+ * Accepte maintenant `conversationState` pour injecter le contexte du fil de discussion.
  */
-export function buildSystemPrompt({ brand, services = [], classification = {}, siteUrl, phone, contactProfile = null, briefing = null, voice = false } = {}) {
+export function buildSystemPrompt({ brand, services = [], classification = {}, siteUrl, phone, contactProfile = null, briefing = null, voice = false, conversationState = null } = {}) {
   const c = classification;
   const catalogue = services.length ? `CATALOGUE RÉEL (ne cite que ces services) : ${services.join(" ; ")}.` : "";
   const serviceHint = c.service && ["prix_delai", "besoin_service"].includes(c.intent)
     ? `Un service du catalogue semble éventuellement lié : « ${c.service} ». Ne le mentionne que si cela aide réellement à répondre.`
     : "";
   const prices = c.intent === "prix_delai" ? PRICE_ANCHORS : "";
+
+  // Construction du contexte conversationnel
+  let convoContext = "";
+  if (conversationState && typeof conversationState === "object") {
+    const parts = [];
+    if (conversationState.active_topic) {
+      parts.push(`Sujet actif du fil : ${conversationState.active_topic}`);
+    }
+    if (conversationState.active_service) {
+      parts.push(`Service en cours : ${conversationState.active_service}`);
+    }
+    if (conversationState.needs_queue?.length > 0) {
+      const needsText = conversationState.needs_queue.map(n => {
+        const txt = n.service ? `« ${n.service} »` : (n.topic ? n.topic : "besoin non précisé");
+        return `${txt}`;
+      }).join(" → ");
+      parts.push(`Besoins exprimés dans cet échange : ${needsText}`);
+    }
+    if (conversationState.preferences && Object.keys(conversationState.preferences).length > 0) {
+      const prefs = conversationState.preferences;
+      const prefParts = [];
+      if (prefs.budget_max_fcfa) prefParts.push(`budget indicatif ≤ ${prefs.budget_max_fcfa} F CFA`);
+      if (prefs.delai_semaines) prefParts.push(`délai souhaité ~ ${prefs.delai_semaines} semaines`);
+      if (prefs.style) prefParts.push(`style : ${prefs.style}`);
+      if (prefParts.length) parts.push(`Préférences client : ${prefParts.join(", ")}`);
+    }
+    if (parts.length > 0) {
+      convoContext = `\nCONTEXTE DE LA CONVERSATION ACTUELLE :\n${parts.join("\n")}\n`;
+    }
+  }
+
   return `Tu es RISING DIGITAL AGENT, le conseiller numérique et assistant conversationnel de RISING DIGITAL SOLUTIONS, basé à Agbelouvé au Togo.
 
 TA MISSION : discuter avec chaque personne comme un conseiller compétent, attentif, naturel et fiable — jamais comme un formulaire automatisé, un télévendeur ou un robot de qualification. La personne peut te parler de numérique, d'entrepreneuriat, d'études, de travail, de vie pratique, de culture, de sciences, de technologie ou de tout autre sujet. Tu dois essayer de l'aider sur le sujet réellement posé, même s'il n'a aucun rapport avec l'entreprise.
@@ -123,7 +155,7 @@ RÈGLES DE CONVERSATION :
 FIABILITÉ :
 - N'invente aucun fait, chiffre, tarif, délai, témoignage, source, actualité ou capacité de l'entreprise.
 - Si une information est incertaine, dis-le clairement et distingue les faits des estimations ou conseils.
-- Tu n'as pas automatiquement accès à Internet en temps réel. Ne prétends pas avoir vérifié une actualité ou une donnée récente si aucune recherche réelle n'a été effectuée. Pour une question qui dépend d'informations récentes, explique cette limite et indique ce qu'il faudrait vérifier.
+- Tu n'as pas automatiquement accès à Internet en temps réel. Ne prétends pas avoir vérifié une actualité ou une donnée récente si aucune recherche réelle n'a pas été effectuée. Pour une question qui dépend d'informations récentes, explique cette limite et indique ce qu'il faudrait vérifier.
 - Pour les sujets médicaux, juridiques, financiers ou de sécurité, donne des informations générales prudentes, signale les limites et recommande un professionnel lorsque la situation le justifie.
 - Ne demande jamais de mot de passe, code secret, code OTP ou donnée bancaire sensible.
 
@@ -132,6 +164,7 @@ ${STRATEGIES[c.intent] || STRATEGIES.question_generale}
 ${contactProfile
     ? `CONTEXTE MÉMORISÉ DE CET INTERLOCUTEUR : sujets abordés : ${(contactProfile.sujets || []).join(", ") || "aucun"}${contactProfile.dernier_besoin ? ` ; dernier besoin exprimé : « ${contactProfile.dernier_besoin} »` : ""}. Utilise ce contexte avec discrétion pour assurer la continuité, sans enfermer la personne dans son ancien besoin.`
     : `Aucun profil antérieur fiable n'est disponible. Découvre le contexte progressivement au fil de la conversation ; ne lance pas un questionnaire.`}
+${convoContext}
 ${voice ? `MESSAGE VOCAL TRANSCRIT : la transcription peut contenir des erreurs. Si un passage est réellement ambigu, demande de répéter uniquement ce passage ; ne devine pas le contenu manquant.` : ""}
 ${briefing ? `CONTEXTE DU JOUR DISPONIBLE (peut aider si pertinent, mais ne garantit pas une actualité exhaustive) :\n${briefing}` : ""}
 ${serviceHint}
@@ -167,14 +200,67 @@ export function shouldReply({ lastOutTs, cooldownH = 0, intent = "question_gener
  * Délai (heures) avant relance, ou null si aucune relance ne se justifie.
  * Les délais restent dans la fenêtre de 24 h de WhatsApp Cloud API (réponse libre interdite au-delà,
  * sauf modèle de message approuvé par Meta — voir processDueFollowups).
+ *
+ * Phase 3 : la décision est déterministe et contextuelle. `ctx` accepte :
+ *   - intent : dernier intent classifié (prioritaire sur l'argument)
+ *   - hasNeed : besoin détecté
+ *   - topic, service : sujet en cours
+ *   - turnCount : nombre d'échanges
+ *   - preferences : { budget_max_fcfa, delai_semaines, style }
+ *   - lastIntent : dernier intent connu
+ *   - lastDueAt / now : pour le backoff progressif des relances successives
  */
-export function nextFollowupDelayH(intent, hasNeed = false) {
-  if (intent === "refus") return null;      // jamais de relance après un refus
-  if (intent === "report") return 20;       // "je reviens demain" -> relance le lendemain, dans la fenêtre
-  if (intent === "prix_delai") return 5;    // devis annoncé, réponse en attente
-  if (intent === "besoin_service" || hasNeed) return 4;
-  // Une question générale ou un conseil ne déclenche jamais une relance commerciale.
-  return null;                              // échange informatif sans intention d'achat : pas de relance
+export function nextFollowupDelayH(intent, hasNeed = false, ctx = {}) {
+  const base = ctx.intent ?? intent;
+  // Un refus interdit toute relance ; un report laisse le client revenir de lui-même.
+  if (base === "refus") return null;
+  if (base === "report") return 20;
+  // Sans besoin commercial, pas de relance (échange purement informatif).
+  if (!ctx.hasNeed && !hasNeed) return null;
+
+  // Contexte enrichi : plus de contexte pertinent = relance plus proche (mais toujours < 24 h).
+  const turns = Number(ctx.turnCount || 0);
+  const hasPrefs = ctx.preferences && (ctx.preferences.budget_max_fcfa || ctx.preferences.delai_semaines);
+  if (base === "prix_delai") return hasPrefs ? 5 : 6;
+  if (base === "besoin_service" || ctx.hasNeed || hasNeed) {
+    if (turns >= 3) return 3; // fil déjà riche -> relance plus rapide
+    return ctx.topic || ctx.service ? 4 : 6;
+  }
+  return null;
+}
+
+/**
+ * Phase 3 : planifie (ou refuse) une relance à partir du contexte réel du fil.
+ * Retourne { delayH, angle, reason } ou null si aucune relance ne se justifie.
+ *
+ * Différences avec l'ancienne logique à délai fixe :
+ *   - tient compte des préférences exprimées (budget/délai) et du nombre d'échanges ;
+ *   - espace les relances successives (une relance déjà restée sans réponse allonge le délai) ;
+ *   - ne relance jamais un refus, une question purement informative, ni un fil en handoff ;
+ *   - conserve le sujet du fil (angle) pour une relance réellement contextualisée.
+ */
+export function planFollowup({ classification = {}, hasNeed = false, conversationState = null, priorRelances = 0, now = Date.now() } = {}) {
+  if (conversationState?.handoff) return null;
+  const state = conversationState && typeof conversationState === "object" ? conversationState : {};
+  const prefs = state.preferences && typeof state.preferences === "object" ? state.preferences : {};
+  const intent = classification.intent ?? state.last_intent ?? null;
+  const topic = classification.topic ?? state.active_topic ?? null;
+  const service = classification.service ?? state.active_service ?? null;
+  const need = Boolean(hasNeed || state.needs_queue?.length);
+  if (!need) return null;
+  let delayH = nextFollowupDelayH(intent, need, {
+    topic, service, hasNeed: need, turnCount: Number(state.turn_count || 0), preferences: prefs,
+  });
+  if (delayH == null) return null;
+  // Relance précédente restée sans réponse : on espace sans jamais dépasser la fenêtre 24 h.
+  const prior = Math.max(0, Number(priorRelances) || 0);
+  if (prior > 0) delayH = Math.min(23, delayH + 6 * Math.min(prior, 3));
+  return {
+    delayH,
+    angle: service || topic || null,
+    dueAt: adjustToDaytime(new Date(new Date(now).getTime() + delayH * 3600_000).toISOString()),
+    reason: `${intent ?? "inconnu"}${service ? ` · ${service}` : ""} · ${prior} relance(s) précédente(s)`,
+  };
 }
 
 // ---- Contrôle de sortie : protection renforcée sur les réponses commerciales ----
@@ -229,6 +315,215 @@ export async function loadContactProfile(env, tenantId, contactId) {
 
 export async function saveContactProfile(env, tenantId, contactId, profile) {
   await setMemory(env, tenantId, `contact:${contactId}`, "profil", JSON.stringify(profile));
+}
+
+// ---- v4.4 : état de conversation persistant (Phase 1) ----
+
+/**
+ * Charge l'état de conversation pour une conversation donnée.
+ * Retourne null si aucune ligne n'existe encore. Jamais bloquant.
+ */
+export async function loadConversationState(env, tenantId, conversationId) {
+  try {
+    const row = await env.DB.prepare(
+      "SELECT active_topic, active_service, needs_queue, preferences, last_intent, last_ai_provider, turn_count, summary FROM conversation_state WHERE tenant_id=? AND conversation_id=?"
+    ).bind(tenantId, conversationId).first();
+    if (!row) return null;
+    return {
+      active_topic: row.active_topic ?? null,
+      active_service: row.active_service ?? null,
+      needs_queue: row.needs_queue ? JSON.parse(row.needs_queue) : [],
+      preferences: row.preferences ? JSON.parse(row.preferences) : {},
+      last_intent: row.last_intent ?? null,
+      last_ai_provider: row.last_ai_provider ?? null,
+      turn_count: Number(row.turn_count || 0),
+      summary: row.summary ?? null,
+    };
+  } catch { return null; }
+}
+
+/**
+ * Crée ou met à jour l'état de conversation. Fusion pure : les besoins et
+ * préférences existants sont conservés, sauf remplacement explicite.
+ * Retourne l'état mis à jour (ou null en cas d'échec silencieux).
+ */
+export async function saveConversationState(env, tenantId, conversationId, updates = {}) {
+  try {
+    const existing = await loadConversationState(env, tenantId, conversationId);
+    const now = nowISO();
+    const s = existing && typeof existing === "object" ? existing : {};
+    const needs = Array.isArray(updates.needs_queue) ? updates.needs_queue : (Array.isArray(s.needs_queue) ? s.needs_queue : []);
+    const prefs = typeof updates.preferences === "object" ? { ...(typeof s.preferences === "object" ? s.preferences : {}), ...updates.preferences } : (typeof s.preferences === "object" ? s.preferences : {});
+    const payload = {
+      active_topic: updates.active_topic !== undefined ? updates.active_topic : s.active_topic ?? null,
+      active_service: updates.active_service !== undefined ? updates.active_service : s.active_service ?? null,
+      needs_queue: needs.slice(-10),
+      preferences: prefs,
+      last_intent: updates.last_intent !== undefined ? updates.last_intent : s.last_intent ?? null,
+      last_ai_provider: updates.last_ai_provider !== undefined ? updates.last_ai_provider : s.last_ai_provider ?? null,
+      turn_count: Number(s.turn_count || 0) + (updates.increment_turn ? 1 : 0),
+      summary: updates.summary !== undefined ? updates.summary : s.summary ?? null,
+    };
+    if (existing) {
+      await env.DB.prepare(
+        `UPDATE conversation_state SET active_topic=?, active_service=?, needs_queue=?, preferences=?, last_intent=?, last_ai_provider=?, turn_count=?, summary=?, last_interaction_at=? WHERE tenant_id=? AND conversation_id=?`
+      ).bind(payload.active_topic, payload.active_service, JSON.stringify(payload.needs_queue), JSON.stringify(payload.preferences), payload.last_intent, payload.last_ai_provider, payload.turn_count, payload.summary, now, tenantId, conversationId).run();
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO conversation_state(tenant_id, conversation_id, active_topic, active_service, needs_queue, preferences, last_intent, last_ai_provider, turn_count, summary, last_interaction_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+      ).bind(tenantId, conversationId, payload.active_topic, payload.active_service, JSON.stringify(payload.needs_queue), JSON.stringify(payload.preferences), payload.last_intent, payload.last_ai_provider, payload.turn_count, payload.summary, now).run();
+    }
+    return payload;
+  } catch (e) {
+    await log(env, "warn", "conversation_state_save_echec", String(e?.message ?? e).slice(0, 300), tenantId).catch(() => {});
+    return null;
+  }
+}
+
+/** Fusion pure et testable : applique une classification sur un état existant,
+ *  retourne le nouvel état (sans écriture DB). Gère l'héritage de topic. */
+export function mergeConversationState(existing, classification, turnIncrement = 1, text = null) {
+  const s = existing && typeof existing === "object" ? { ...existing } : { active_topic: null, active_service: null, needs_queue: [], preferences: {}, last_intent: null, last_ai_provider: null, turn_count: 0, summary: null };
+  const needs = [...(Array.isArray(s.needs_queue) ? s.needs_queue : [])];
+  if (classification?.intent === "besoin_service" || classification?.service) {
+    needs.push({ text: null, service: classification.service, topic: classification.topic, intent: classification.intent });
+  }
+  const prefs = typeof s.preferences === "object" ? { ...s.preferences } : {};
+  if (text) {
+    const extracted = extractPreferences(text);
+    for (const k of Object.keys(extracted)) prefs[k] = extracted[k];
+  }
+  const next = {
+    active_topic: classification?.topic ? classification.topic : s.active_topic,
+    active_service: classification?.service ? classification.service : s.active_service,
+    needs_queue: needs.slice(-10),
+    preferences: prefs,
+    last_intent: classification?.intent ?? s.last_intent,
+    last_ai_provider: s.last_ai_provider ?? null,
+    turn_count: Number(s.turn_count || 0) + (turnIncrement ? 1 : 0),
+    summary: s.summary ?? null,
+  };
+  next.summary = buildEpisodeSummary(next, classification);
+  return next;
+}
+
+// ---- v4.5 : mémoire épisodique + préférences client (Phase 2) ----
+
+/**
+ * Extraction locale et gratuite des préférences client à partir d'un message.
+ * Retourne un objet partiel { budget_max_fcfa, delai_semaines, style } ; seules
+ * les valeurs détectées sont présentes (jamais de valeur inventée).
+ */
+export function extractPreferences(text) {
+  const t = String(text ?? "");
+  const out = {};
+  // Budget : "budget de 100 000", "max 200000 F", "pas plus de 50 000"
+  const budgetMatch = t.match(/(?:budget|max(?:imum)?|pas plus de|jusqu'à|jusqu'a)\s*(?:de\s*)?(\d[\d\s.,']*)\s*(?:f\s?cfa|cfa|francs?)?/i);
+  if (budgetMatch) {
+    const n = Number(String(budgetMatch[1]).replace(/\s/g, "").replace(",", ".").replace("'", ""));
+    if (Number.isFinite(n) && n > 0) out.budget_max_fcfa = Math.round(n);
+  }
+  // Délai : "en 2 semaines", "sous 1 mois", "d'ici 3 semaines"
+  const delaiMatch = t.match(/(?:en|sous|d'ici|dans)\s+(\d+)\s*(semaine|mois|jour)/i);
+  if (delaiMatch) {
+    const n = Number(delaiMatch[1]);
+    const unit = delaiMatch[2].toLowerCase();
+    if (Number.isFinite(n) && n > 0) {
+      out.delai_semaines = unit.startsWith("mois") ? n * 4 : unit.startsWith("jour") ? Math.max(1, Math.round(n / 7)) : n;
+    }
+  }
+  // Style de communication
+  if (/(concis|bref|court|rapide)/i.test(t)) out.style = "concis";
+  else if (/(détaillé|detaille|complet|expliquer en détail|tout expliquer)/i.test(t)) out.style = "détaillé";
+  return out;
+}
+
+/**
+ * Résumé épisodique déterministe (sans IA) du fil de discussion.
+ * Construit à partir de l'état existant + de la classification courante.
+ */
+export function buildEpisodeSummary(state, classification) {
+  const s = state && typeof state === "object" ? state : {};
+  const parts = [];
+  if (s.active_service) parts.push(`service : ${s.active_service}`);
+  const needs = Array.isArray(s.needs_queue) ? s.needs_queue : [];
+  if (needs.length) {
+    const last = needs[needs.length - 1];
+    if (last?.service && last.service !== s.active_service) parts.push(`besoin : ${last.service}`);
+  }
+  if (classification?.intent) parts.push(`dernier intent : ${classification.intent}`);
+  const turns = Number(s.turn_count || 0);
+  if (turns > 0) parts.push(`${turns} échange${turns > 1 ? "s" : ""}`);
+  return parts.length ? parts.join(" · ") : null;
+}
+
+/**
+ * Phase 4 : génère un briefing complet pour transfert à un humain.
+ * Inclut le contexte conversationnel complet + les derniers messages.
+ * Retourné pour être joint à l'alerte admin.
+ */
+export async function buildConversationBriefing(env, tenantId, conversationId, options = {}) {
+  const { maxHistory = 6, includeState = true } = options;
+
+  // État conversationnel complet
+  let state = null;
+  if (includeState) {
+    const { loadConversationState } = await import("./conversation.js");
+    state = await loadConversationState(env, tenantId, conversationId);
+  }
+
+  // Historique récent
+  const history = (await env.DB.prepare(
+    "SELECT direction, body, ts FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT ?"
+  ).bind(conversationId, maxHistory).all()).results || [];
+
+  // Lead associé (service, besoin, statut)
+  const lead = await env.DB.prepare(
+    "SELECT service, need, status FROM leads WHERE tenant_id=? AND contact_id IN (SELECT contact_id FROM conversations WHERE id=?) ORDER BY id DESC LIMIT 1"
+  ).bind(tenantId, conversationId).first();
+
+  const parts = [];
+
+  if (state) {
+    parts.push(`=== CONTEXTE CONVERSATIONNEL ===`);
+    if (state.active_service) parts.push(`Service en cours : ${state.active_service}`);
+    if (state.active_topic) parts.push(`Sujet : ${state.active_topic}`);
+    if (state.needs_queue?.length) {
+      parts.push(`Besoins exprimés :`);
+      for (const n of state.needs_queue) {
+        const label = n.service ? `« ${n.service} »` : (n.topic || n.text || "besoin non précisé");
+        parts.push(`  - ${label} (intent: ${n.intent || "?"})`);
+      }
+    }
+    if (state.preferences && Object.keys(state.preferences).length) {
+      const prefs = [];
+      if (state.preferences.budget_max_fcfa) prefs.push(`budget ≤ ${state.preferences.budget_max_fcfa} F CFA`);
+      if (state.preferences.delai_semaines) prefs.push(`délai ~ ${state.preferences.delai_semaines} sem.`);
+      if (state.preferences.style) prefs.push(`style : ${state.preferences.style}`);
+      parts.push(`Préférences : ${prefs.join(" ; ")}`);
+    }
+    if (state.summary) parts.push(`Résumé : ${state.summary}`);
+    parts.push(`${state.turn_count || 0} échange(s) au total.`);
+  }
+
+  if (lead) {
+    parts.push(`\n=== PROSPECT (CRM) ===`);
+    parts.push(`Service : ${lead.service || "non précisé"}`);
+    parts.push(`Besoin : ${lead.need || "non précisé"}`);
+    parts.push(`Statut : ${lead.status || "nouveau"}`);
+  }
+
+  if (history.length) {
+    parts.push(`\n=== DERNIERS ÉCHANGES (${history.length}) ===`);
+    const chronological = [...history].reverse();
+    for (const m of chronological) {
+      const role = m.direction === "in" ? "Client" : "Agent";
+      const time = m.ts ? new Date(m.ts).toLocaleString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "";
+      parts.push(`[${time}] ${role} : ${m.body?.slice(0, 300) || "[message non-textuel]"}`);
+    }
+  }
+
+  return parts.join("\n");
 }
 
 /** Fusion pure (testable) : sujets déjà abordés (5 max), dernier service, dernier besoin. */

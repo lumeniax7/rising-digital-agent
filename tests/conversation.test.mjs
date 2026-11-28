@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyMessage, detectTopic, buildSystemPrompt, shouldReply, nextFollowupDelayH, sanitizeReply, adjustToDaytime, mergeProfile } from "../src/social/conversation.js";
+import { classifyMessage, detectTopic, buildSystemPrompt, shouldReply, nextFollowupDelayH, planFollowup, sanitizeReply, adjustToDaytime, mergeProfile } from "../src/social/conversation.js";
 
 const HOUR = 3600_000;
 
@@ -98,6 +98,28 @@ test("relances jamais la nuit (22h-7h à Lomé = UTC)", () => {
   assert.equal(adjustToDaytime("2026-11-28T02:30:00Z"), "2026-11-28T09:00:00.000Z");   // nuit -> 9h
   assert.equal(adjustToDaytime("2026-11-28T23:15:00Z"), "2026-11-29T09:00:00.000Z");   // tard -> lendemain 9h
   assert.equal(adjustToDaytime("2026-11-28T14:00:00Z"), "2026-11-28T14:00:00Z");       // jour : inchangé
+});
+
+test("planFollowup : contexte enrichi ajuste le délai, backoff progressif, angle contextuel", () => {
+  // 1. Contexte vide -> délai standard (4h pour besoin_service)
+  const base1 = planFollowup({ classification: { intent: "besoin_service", topic: "site_web", service: "Création de site et application" }, hasNeed: true, conversationState: null, priorRelances: 0, now: Date.now() });
+  assert.ok(base1.delayH >= 4 && base1.delayH <= 6);
+
+  // 2. Contexte enrichi : 3 échanges + préférence budget -> relance plus proche (3h)
+  const base2 = planFollowup({ classification: { intent: "besoin_service", topic: "site_web", service: "Création de site et application" }, hasNeed: true, conversationState: { turn_count: 3, preferences: { budget_max_fcfa: 100000 } }, priorRelances: 0, now: Date.now() });
+  assert.ok(base2.delayH >= 3 && base2.delayH <= 5);
+
+  // 3. Relance précédente non résolue : backoff progressif (4h + 6h = 10h)
+  const base3 = planFollowup({ classification: { intent: "besoin_service", topic: "site_web", service: "Création de site et application" }, hasNeed: true, conversationState: { turn_count: 2, preferences: { budget_max_fcfa: 100000 } }, priorRelances: 1, now: Date.now() });
+  assert.ok(base3.delayH >= 6 && base3.delayH <= 10);
+
+  // 4. Refus -> pas de relance
+  const base4 = planFollowup({ classification: { intent: "refus" }, hasNeed: false, conversationState: { turn_count: 3 }, priorRelances: 0, now: Date.now() });
+  assert.equal(base4, null);
+
+  // 5. Handoff -> pas de relance
+  const base5 = planFollowup({ classification: { intent: "besoin_service" }, hasNeed: true, conversationState: { handoff: 1, turn_count: 1 }, priorRelances: 0, now: Date.now() });
+  assert.equal(base5, null);
 });
 
 test("mémoire par contact : fusion des sujets et du dernier besoin", () => {

@@ -6,7 +6,7 @@ import { log } from "../core/log.js";
 import { runAI } from "../ai/router.js";
 import { upsertContact, upsertLead, detectLeadSignal } from "../crm/crm.js";
 import { brandProfile } from "../memory/memory.js";
-import { classifyMessage, buildSystemPrompt, shouldReply, nextFollowupDelayH, cancelScheduledFollowups, scheduleFollowup, sanitizeReply, loadContactProfile, saveContactProfile, mergeProfile, lookupFaq, rememberFaq } from "./conversation.js";
+import { classifyMessage, buildSystemPrompt, shouldReply, nextFollowupDelayH, planFollowup, cancelScheduledFollowups, scheduleFollowup, sanitizeReply, loadContactProfile, saveContactProfile, mergeProfile, lookupFaq, rememberFaq, loadConversationState, saveConversationState, mergeConversationState, buildConversationBriefing } from "./conversation.js";
 import { parseBriefing } from "../content/briefing.js";
 import AFFICHES from "../content/services.json" with { type: "json" };
 
@@ -306,24 +306,31 @@ async function processInboxMessage(env, inbox) {
   const classification = classifyMessage(text);
   try {
     await cancelScheduledFollowups(env, conv.id);
-    const delayH = nextFollowupDelayH(classification.intent, signal.hasNeed);
-    if (delayH && !conv.handoff) {
-      await scheduleFollowup(env, { tenantId, contactId, conversationId: conv.id, angle: classification.service || null, dueAt: new Date(Date.now() + delayH * 3600_000).toISOString() });
-      await safeLog(env, "info", "relance_programmee", `contact #${contactId} dans ${delayH}h (intent=${classification.intent})`, tenantId);
+    // Phase 3 : relance contextualisée — contexte réel du fil (état, préférences, échanges).
+    const conversationState = await loadConversationState(env, tenantId, conv.id).catch(() => null);
+    const priorRelances = Number(conversationState?.turn_count || 0);
+    const plan = planFollowup({ classification, hasNeed: signal.hasNeed, conversationState, priorRelances });
+    if (plan && !conv.handoff) {
+      await scheduleFollowup(env, { tenantId, contactId, conversationId: conv.id, angle: plan.angle, dueAt: plan.dueAt });
+      await safeLog(env, "info", "relance_contextualisee", `contact #${contactId} dans ${plan.delayH}h (${plan.reason})`, tenantId);
     }
   } catch (e) { await safeLog(env, "warn", "relance_programmation_echec", e, tenantId); }
 
   if (isHumanHandoff(text)) {
     await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=?").bind(conv.id).run();
     await upsertLead(env, tenantId, contactId, { status: "à traiter par un humain" });
-    // Le prospect est bien enregistré dans le CRM. On tente aussi une alerte réelle
-    // vers l'administrateur et on n'annonce son envoi que si Meta confirme un message.
+    // Le prospect est bien enregistré dans le CRM. On génère un briefing complet pour l'alerte admin.
     let alertSent = false;
     try {
+      const briefing = await buildConversationBriefing(env, tenantId, conv.id, {
+        maxHistory: 6,
+        includeState: true
+      });
       const { notifyAdmin } = await import("./alerts.js");
       alertSent = await notifyAdmin(env,
-        `🤝 DEMANDE DE CONSEILLER HUMAIN\nContact : +${message.from}\nMessage : ${String(text).slice(0, 500)}\nConversation : #${conv.id}\nÀ traiter dans le tableau de bord RISING DIGITAL AGENT.`);
-    } catch (e) { await safeLog(env, "warn", "wa_handoff_alerte_echec", e, tenantId); }
+        `🤝 DEMANDE DE CONSEILLER HUMAIN\nContact : +${message.from}\nMessage : ${String(text).slice(0, 500)}\nConversation : #${conv.id}\n\n=== CONTEXTE COMPLET DU FIL ===\n${briefing}\n\n=== ACTION REQUISE ===\nTransmettre à l'équipe pour proposition et devis expliqué, sans engagement.`
+      );
+    } catch (e) { await safeLog(env, "warn", "wa_handoff_briefing_echec", e, tenantId); }
     const reply = alertSent
       ? "Bien sûr. J'ai enregistré votre demande et l'équipe vient d'être alertée. Un membre pourra reprendre cette conversation. Merci de votre patience."
       : "Bien sûr. J'ai enregistré votre demande et marqué cette conversation pour un suivi humain. Je ne peux toutefois pas confirmer que l'alerte WhatsApp à l'équipe a été délivrée. Vous pouvez aussi joindre directement Rising Digital Solutions au +228 93 39 25 15.";
@@ -372,9 +379,11 @@ async function processInboxMessage(env, inbox) {
   const briefing = parseBriefing((await env.DB.prepare("SELECT v FROM meta WHERE k='briefing_du_jour'").first().catch(() => null))?.v);
   const history = (await env.DB.prepare("SELECT direction, body FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 8").bind(conv.id).all())
     .results.filter(h => !String(h.body || "").startsWith("[image]")).slice(-6).reverse();
+  // État conversationnel persistant (Phase 1) : topic, besoins, préférences, contexte du fil.
+  const conversationState = await loadConversationState(env, tenantId, conv.id).catch(() => null);
   const system = buildSystemPrompt({
     brand, services: services.map(s => s.title), classification,
-    siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`, contactProfile, briefing, voice,
+    siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`, contactProfile, briefing, voice, conversationState,
   });
   const msgs = [{ role: "system", content: system }, ...history.map(item => ({ role: item.direction === "in" ? "user" : "assistant", content: item.body }))];
   const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 700 });
@@ -417,6 +426,13 @@ async function processInboxMessage(env, inbox) {
     if (aiReplyAccepted && classification.service && ["prix_delai", "besoin_service", "conseil", "question_generale"].includes(classification.intent))
       await rememberFaq(env, tenantId, text, reply);
   } catch { /* mémoire FAQ indisponible : sans conséquence */ }
+  // État conversationnel (Phase 1) : persiste le fil de discussion. Jamais bloquant.
+  try {
+    await saveConversationState(env, tenantId, conv.id, mergeConversationState(conversationState, classification, 1, text));
+    if (ai.ok && typeof ai.provider === "string") {
+      await saveConversationState(env, tenantId, conv.id, { last_ai_provider: ai.provider });
+    }
+  } catch (e) { await safeLog(env, "warn", "conversation_state_echec", e, tenantId); }
   await safeLog(env, "info", "wa_reponse_envoyee", `…${message.from.slice(-4)} ${aiReplyAccepted ? "via " + ai.provider : "(réponse de secours)"}`, tenantId);
 }
 
