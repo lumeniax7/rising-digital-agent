@@ -16,6 +16,13 @@ test("classification : refus, report, prix, besoin, salutation, conseil", () => 
   assert.equal(classifyMessage("bonjour").intent, "salutation");
   assert.equal(classifyMessage("peux-tu m'expliquer comment fonctionne un chatbot ?").intent, "conseil");
   assert.equal(classifyMessage("c'est quoi le nombre d'habitants du Togo ?").intent, "question_generale");
+  assert.equal(classifyMessage("Combien d'habitants compte le Togo ?").intent, "question_generale");
+  assert.equal(classifyMessage("Combien coûte un site web ?").intent, "prix_delai");
+  assert.equal(classifyMessage("Quel budget faut-il pour ouvrir un restaurant ?").intent, "conseil");
+  assert.equal(classifyMessage("Quel budget prévoir pour un site web ?").intent, "prix_delai");
+  assert.equal(classifyMessage("Je veux savoir pourquoi le ciel est bleu.").intent, "conseil");
+  assert.equal(classifyMessage("La météo demain sera-t-elle bonne ?").intent, "question_generale");
+  assert.equal(classifyMessage("Je reviens vers vous plus tard.").intent, "report");
 });
 
 test("le pont vers un service ne cite que le catalogue réel", () => {
@@ -41,33 +48,50 @@ test("relances : jamais après un refus, délais calibrés, tous < 24 h (fenêtr
   assert.equal(nextFollowupDelayH("refus"), null);
   assert.equal(nextFollowupDelayH("salutation", false), null);
   assert.ok(nextFollowupDelayH("report") >= 12 && nextFollowupDelayH("report") <= 23);
-  for (const i of ["prix_delai", "besoin_service", "conseil"]) {
+  for (const i of ["prix_delai", "besoin_service"]) {
     const h = nextFollowupDelayH(i, true);
     assert.ok(h >= 4 && h <= 20, `${i} -> ${h}`);
   }
+  assert.equal(nextFollowupDelayH("conseil"), null);
+  assert.equal(nextFollowupDelayH("question_generale"), null);
 });
 
-test("prompt système : objectif de conversion, honnêteté, catalogue réel, prix officiels", () => {
+test("prompt système : conseiller d'abord, vente uniquement si pertinente", () => {
   const p = buildSystemPrompt({
     brand: "ton : humain", services: ["Création de site et application", "Intelligence artificielle"],
     classification: classifyMessage("combien coûte un site web ?"), siteUrl: "https://risingdigitalsolutions.pages.dev",
   });
-  assert.match(p, /AU MOINS UN service/i);
-  assert.match(p, /n'invente JAMAIS/);
+  assert.match(p, /conseiller compétent/i);
+  assert.match(p, /Ne propose un service.*que si ce service répond réellement au besoin/i);
+  assert.doesNotMatch(p, /AU MOINS UN service/i);
+  assert.doesNotMatch(p, /100 mots/i);
+  assert.match(p, /N'invente aucun fait/i);
   assert.match(p, /Création de site et application/);
-  assert.match(p, /25 000 à 350 000 F CFA/);           // repères officiels du site, jamais inventés
+  assert.match(p, /25 000 à 350 000 F CFA/);           // repères officiels, uniquement sur demande tarifaire
   assert.match(p, /indicatifs/);
   assert.match(p, /https:\/\/risingdigitalsolutions\.pages\.dev/);
 });
 
-test("filtre anti-hallucination : seuls les repères officiels passent", () => {
-  assert.ok(sanitizeReply("Le site vitrine démarre à 25 000 F CFA, à titre indicatif."));
-  assert.ok(sanitizeReply("Les repères vont de 25 000 à 350 000 F CFA et de 75 000 à 250 000 F CFA."));
-  assert.ok(sanitizeReply("Je ne sais pas exactement, l'équipe précisera le devis."));
-  assert.ok(!sanitizeReply("Ça coûte 40 000 F CFA, c'est promis."));       // prix inventé
-  assert.ok(!sanitizeReply("Résultat garanti en 3 jours !"));              // promesse interdite
-  assert.ok(!sanitizeReply("Voir https://exemple.com pour détails"));      // lien externe
-  assert.ok(!sanitizeReply(""));                                           // vide
+test("question générale : aucun argumentaire commercial ni prix du catalogue", () => {
+  const p = buildSystemPrompt({
+    brand: "Rising Digital Solutions",
+    services: ["Création de site et application"],
+    classification: classifyMessage("Quelle est la capitale du Japon ?"),
+  });
+  assert.match(p, /question générale n'est pas une occasion obligatoire de vendre/i);
+  assert.doesNotMatch(p, /25 000 à 350 000 F CFA/);
+  assert.doesNotMatch(p, /Un service du catalogue semble éventuellement lié/);
+});
+
+test("filtre de sortie : les réponses générales ne sont pas rejetées pour un montant", () => {
+  assert.ok(sanitizeReply("Le site vitrine démarre à 25 000 F CFA, à titre indicatif.", { strictPrices: true }));
+  assert.ok(sanitizeReply("Les repères vont de 25 000 à 350 000 F CFA et de 75 000 à 250 000 F CFA.", { strictPrices: true }));
+  assert.ok(sanitizeReply("Le budget national est de 40 000 milliards de francs selon le scénario cité."));
+  assert.ok(!sanitizeReply("Le devis est de 40 000 F CFA.", { strictPrices: true }));
+  assert.ok(!sanitizeReply("Résultat garanti en 3 jours !", { strictPrices: true }));
+  assert.ok(sanitizeReply("Consultez https://exemple.com pour la documentation officielle."));
+  assert.ok(!sanitizeReply("javascript:alert(1)"));
+  assert.ok(!sanitizeReply(""));
 });
 
 test("relances jamais la nuit (22h-7h à Lomé = UTC)", () => {

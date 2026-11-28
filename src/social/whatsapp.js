@@ -10,7 +10,8 @@ import { classifyMessage, buildSystemPrompt, shouldReply, nextFollowupDelayH, ca
 import { parseBriefing } from "../content/briefing.js";
 import AFFICHES from "../content/services.json" with { type: "json" };
 
-const HANDOFF = /(litige|remboursement|plainte|réclamation|parler à (un|une) (humain|personne|agent)|responsable|contrat|paiement direct)/i;
+const HANDOFF = /(litige|remboursement|plainte|réclamation|parler à (un|une) (humain|personne|agent|conseiller|conseillère)|parler avec (un|une) (humain|personne|agent|conseiller|conseillère)|je veux (parler à|un|une) (un |une )?(conseiller|conseillère|humain|agent)|contacter l'équipe|responsable|contrat|paiement direct)/i;
+export function isHumanHandoff(text) { return HANDOFF.test(String(text ?? "")); }
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_MESSAGES = 20;
 const MAX_ATTEMPTS = 5;
@@ -312,13 +313,23 @@ async function processInboxMessage(env, inbox) {
     }
   } catch (e) { await safeLog(env, "warn", "relance_programmation_echec", e, tenantId); }
 
-  if (HANDOFF.test(text)) {
+  if (isHumanHandoff(text)) {
     await env.DB.prepare("UPDATE conversations SET handoff=1 WHERE id=?").bind(conv.id).run();
     await upsertLead(env, tenantId, contactId, { status: "à traiter par un humain" });
-    const reply = "Merci pour votre message 🙏 Ce point demande l'attention d'un membre de l'équipe : il vous répondra personnellement très vite.";
+    // Le prospect est bien enregistré dans le CRM. On tente aussi une alerte réelle
+    // vers l'administrateur et on n'annonce son envoi que si Meta confirme un message.
+    let alertSent = false;
+    try {
+      const { notifyAdmin } = await import("./alerts.js");
+      alertSent = await notifyAdmin(env,
+        `🤝 DEMANDE DE CONSEILLER HUMAIN\nContact : +${message.from}\nMessage : ${String(text).slice(0, 500)}\nConversation : #${conv.id}\nÀ traiter dans le tableau de bord RISING DIGITAL AGENT.`);
+    } catch (e) { await safeLog(env, "warn", "wa_handoff_alerte_echec", e, tenantId); }
+    const reply = alertSent
+      ? "Bien sûr. J'ai enregistré votre demande et l'équipe vient d'être alertée. Un membre pourra reprendre cette conversation. Merci de votre patience."
+      : "Bien sûr. J'ai enregistré votre demande et marqué cette conversation pour un suivi humain. Je ne peux toutefois pas confirmer que l'alerte WhatsApp à l'équipe a été délivrée. Vous pouvez aussi joindre directement Rising Digital Solutions au +228 93 39 25 15.";
     const response = await send(env, message.from, reply);
     await persistReply(env, inbox, tenantId, conv.id, response, reply);
-    await safeLog(env, "info", "wa_transfert_humain", `contact …${message.from.slice(-4)}`, tenantId);
+    await safeLog(env, "info", "wa_transfert_humain", `contact …${message.from.slice(-4)} alerte=${alertSent ? "envoyee" : "non_confirmee"}`, tenantId);
     return;
   }
 
@@ -344,7 +355,7 @@ async function processInboxMessage(env, inbox) {
 
   // FAQ auto-apprenante (v4.3) : question posée 3+ fois -> réponse instantanée mémorisée,
   // sans appel IA. Uniquement pour les messages à visée de réponse (pas les salutations pures).
-  if (!["salutation", "refus", "report"].includes(classification.intent)) {
+  if (classification.service && !["salutation", "refus", "report"].includes(classification.intent)) {
     try {
       const faqAnswer = await lookupFaq(env, tenantId, text);
       if (faqAnswer) {
@@ -366,17 +377,21 @@ async function processInboxMessage(env, inbox) {
     siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`, contactProfile, briefing, voice,
   });
   const msgs = [{ role: "system", content: system }, ...history.map(item => ({ role: item.direction === "in" ? "user" : "assistant", content: item.body }))];
-  const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 300 });
-  // Filtre anti-hallucination (v4.2) : une réponse contenant un prix hors repères officiels,
-  // un lien externe ou une promesse ("garanti") est rejetée et remplacée par le repli statique.
+  const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 700 });
+  // Le filtre de prix ne s'applique qu'aux demandes commerciales : une réponse générale
+  // peut légitimement parler de montants, d'années ou de conversions sans être rejetée.
+  const aiReplyAccepted = ai.ok && sanitizeReply(ai.text, { strictPrices: ["prix_delai", "besoin_service"].includes(classification.intent) });
   let reply;
-  if (ai.ok && sanitizeReply(ai.text)) {
-    reply = ai.text.slice(0, 1200);
+  if (aiReplyAccepted) {
+    reply = String(ai.text).trim();
+  } else if (ai.ok) {
+    await safeLog(env, "warn", "ia_reponse_rejetee", "réponse IA vide, trop longue ou non conforme au contrôle commercial", tenantId);
+    reply = classification.intent === "prix_delai"
+      ? "Je préfère ne pas vous communiquer un montant qui ne serait pas confirmé. Le tarif dépend de ce qui est réellement à réaliser. Quel résultat souhaitez-vous obtenir ?"
+      : "Je veux vous répondre correctement, mais ma réponse n'est pas assez fiable pour vous être envoyée. Pouvez-vous préciser votre question en une phrase ?";
   } else {
-    if (ai.ok) await safeLog(env, "warn", "ia_reponse_rejetee", "réponse IA rejetée par le filtre anti-hallucination", tenantId);
-    // Repli quand l IA est indisponible (quota épuisé, panne fournisseur) : message
-    // DISTINCT — l'utilisateur sait que sa demande sera traitée, le journal trace l'échec.
-    reply = "Merci pour votre message 🙏 Je le transmets à l'équipe qui vous répondra personnellement. Le catalogue est visible ici : https://risingdigitalsolutions.pages.dev";
+    await safeLog(env, "error", "wa_ia_indisponible", ai.reason || "aucun fournisseur IA disponible", tenantId);
+    reply = "Je rencontre momentanément une difficulté technique pour formuler une réponse fiable. Je préfère vous le dire plutôt que d'inventer une réponse ou de prétendre avoir transmis votre demande. Vous pouvez réessayer dans quelques instants ; si vous souhaitez parler à une personne de l'équipe, dites simplement « parler à un conseiller ».";
   }
   // Affiche du service détecté (v4.2) : image WhatsApp + légende, envoyée AVANT la réponse texte.
   // Échec non bloquant : la réponse texte part dans tous les cas.
@@ -399,10 +414,10 @@ async function processInboxMessage(env, inbox) {
   await persistReply(env, inbox, tenantId, conv.id, response, reply);
   // FAQ auto-apprenante (v4.3) : mémorise question + réponse publiée. Jamais bloquant.
   try {
-    if (["prix_delai", "besoin_service", "conseil", "question_generale"].includes(classification.intent))
+    if (aiReplyAccepted && classification.service && ["prix_delai", "besoin_service", "conseil", "question_generale"].includes(classification.intent))
       await rememberFaq(env, tenantId, text, reply);
   } catch { /* mémoire FAQ indisponible : sans conséquence */ }
-  await safeLog(env, "info", "wa_reponse_envoyee", `…${message.from.slice(-4)} ${ai.ok ? "via " + ai.provider : "(repli statique)"}`, tenantId);
+  await safeLog(env, "info", "wa_reponse_envoyee", `…${message.from.slice(-4)} ${aiReplyAccepted ? "via " + ai.provider : "(réponse de secours)"}`, tenantId);
 }
 
 async function markCompleted(env, wamid) {

@@ -1,4 +1,4 @@
-# Déploiement (GitHub + Cloudflare, 0 USD)
+# Déploiement (GitHub + Cloudflare, quotas gratuits limités)
 
 ## 1. Dépôt GitHub
 
@@ -20,7 +20,7 @@ Le Worker `rising-digital-agent` est relié au dépôt GitHub `lumeniax7/rising-
 
 Ainsi, Cloudflare exécute les tests avant `wrangler deploy` sur `main`. Workers Builds gère l’authentification de déploiement; aucun identifiant Cloudflare n’est requis dans les secrets GitHub Actions pour cette configuration. Ne configurez pas un second `wrangler deploy` dans GitHub Actions.
 
-Initialiser le schéma D1 une seule fois avec `npm run db:init` ou la console D1. Vérifier dans `wrangler.toml` l’identifiant D1 `rds-agent` et les crons quotidiens ainsi que celui de reprise toutes les 15 minutes.
+Pour une nouvelle installation, initialiser le schéma D1 une seule fois avec `npm run db:init` ou la console D1. Pour une mise à jour d'une installation existante, ne créez pas une nouvelle base : conservez la base D1 et les secrets. Le Worker applique les adaptations de schéma et migre les anciennes références de modèles IA lors de son initialisation. Vérifier dans `wrangler.toml` l’identifiant D1 `rds-agent` et les crons.
 
 Dans le Worker → Settings → **Variables and Secrets**, ajouter les secrets applicatifs listés dans `docs/VARIABLES.md`. Ils servent à l’exécution du Worker; ils ne sont ni des identifiants de build ni des secrets GitHub Actions.
 

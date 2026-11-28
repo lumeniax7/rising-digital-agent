@@ -1,11 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { detectLeadSignal } from "../src/crm/crm.js";
-import { handleWhatsApp, processPendingWhatsApp } from "../src/social/whatsapp.js";
+import { handleWhatsApp, processPendingWhatsApp, isHumanHandoff } from "../src/social/whatsapp.js";
 import { hmacHex } from "../src/core/crypto.js";
 import { graph } from "../src/social/meta.js";
 
-const HANDOFF = /(litige|remboursement|plainte|réclamation|parler à (un|une) (humain|personne|agent)|responsable|contrat|paiement direct)/i;
 const APP_SECRET = "test-app-secret";
 const TOKEN = "test-meta-token";
 const payload = JSON.stringify({ object: "whatsapp_business_account", entry: [{ changes: [{ value: {
@@ -20,9 +19,10 @@ async function signedRequest(body = payload, signature = true, db = new FakeD1()
 }
 
 test("détection de transfert humain", () => {
-  for (const t of ["je veux un remboursement", "je voudrais parler à une personne", "c'est un litige !!", "quel est le contrat ?"])
-    assert.ok(HANDOFF.test(t), t);
-  assert.ok(!HANDOFF.test("bonjour, je voudrais un site web"));
+  for (const t of ["je veux un remboursement", "je voudrais parler à une personne", "je souhaite parler à un conseiller", "c'est un litige !!", "quel est le contrat ?"])
+    assert.ok(isHumanHandoff(t), t);
+  assert.ok(!isHumanHandoff("bonjour, je voudrais un site web"));
+  assert.ok(!isHumanHandoff("pouvez-vous m'expliquer comment créer un site web ?"));
 });
 
 test("qualification de prospect sans inventer de tarif", () => {

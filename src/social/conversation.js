@@ -1,4 +1,4 @@
-// Moteur de conversation v4.2 — diversification des sujets, conversion en client, relances,
+// Moteur de conversation v4.4 — conseiller multi-sujets, mémoire, qualification respectueuse, relances,
 // filtre anti-hallucination, mémoire par contact, envois de jour uniquement.
 // Principes : (1) le classement du message est local et gratuit (aucun appel IA supplémentaire) ;
 // (2) honnêteté absolue — jamais de prix, délai ou information inventés, "je ne sais pas" autorisé ;
@@ -32,9 +32,11 @@ const TOPICS = [
 
 // Mots-clés d'intention (priorité : refus > report > prix > besoin > salutation > conseil).
 const RE_REFUS = /(pas intéressé|pas interesse|pas interessante|non merci|ne m'écrivez plus|n'insistez pas|arrêtez|arretez|désabonner|desabonner|\bstop\b)/i;
-const RE_REPORT = /(plus tard|à plus tard|je reviens|reviens vers|demain|la semaine prochaine|le mois prochain|pas maintenant|je te recontacte|je vous recontacte|l'année prochaine)/i;
-const RE_PRIX = /(prix|combien|tarif|coûte|coute|budget|devis|cher|chère|chere|délai|delai|combien de temps)/i;
-const RE_BESOIN = /(je veux|je voudrais|j'aimerais|je cherche|j'ai besoin|besoin de|proposez|proposez-moi|faire pour moi|vous pouvez (créer|faire|faire))/i;
+const RE_REPORT = /(plus tard|à plus tard|pas maintenant|je reviens(?: vers vous)?|je te recontacte|je vous recontacte|on en reparle plus tard|on reparle(?:ra)? demain|rappellez?-moi plus tard)/i;
+// « Combien » seul n'est pas une intention commerciale : « combien d'habitants ? » reste une question générale.
+const RE_PRIX = /(prix|tarif|coûte|coute|budget|devis|cher|chère|chere|délai|delai|combien\s+(?:coûte|coute|ça coûte|cela coûte|vous facturez|pour (?:créer|réaliser|livrer))|quel(?:le)?\s+(?:est\s+)?le\s+(?:prix|tarif|coût|cout))/i;
+const RE_PRIX_EXPLICITE = /(prix|tarif|coûte|coute|devis|cher|chère|chere|délai|delai|combien\s+(?:coûte|coute|ça coûte|cela coûte|vous facturez|pour (?:créer|réaliser|livrer)))/i;
+const RE_BESOIN = /(je veux(?!\s+(?:savoir|comprendre|connaître|connaitre|apprendre|demander))|je voudrais(?!\s+(?:savoir|comprendre|connaître|connaitre))|j'aimerais(?!\s+(?:savoir|comprendre|connaître|connaitre))|je cherche(?!\s+à\s+(?:comprendre|savoir|apprendre))|j'ai besoin|besoin de|proposez|proposez-moi|faire pour moi|vous pouvez (?:créer|faire))/i;
 const RE_SALUT = /^(bonjour|bonsoir|salut|hello|hi|coucou|bjr|slt|bonne (journée|journee|soirée|soiree))\b/i;
 const RE_CONSEIL = /(conseil|astuce|aide|comment|pourquoi|quel(le)?|est-ce que|peux-tu|pouvez-vous|m'expliquer|explique)/i;
 
@@ -67,11 +69,13 @@ export function classifyMessage(text) {
   if (RE_REFUS.test(t)) return { intent: "refus", topic: null, service: null };
   if (RE_REPORT.test(t)) return { intent: "report", topic: null, service: null };
   const topic = detectTopic(t);
-  if (RE_PRIX.test(t)) return { intent: "prix_delai", topic: topic?.key ?? null, service: topic?.service ?? null };
+  const demandeTarif = RE_PRIX.test(t) && (RE_PRIX_EXPLICITE.test(t) || (topic && topic.key !== "entrepreneuriat"));
+  if (demandeTarif && (topic || /vos services|votre prestation|rising digital|notre offre/i.test(t)))
+    return { intent: "prix_delai", topic: topic?.key ?? null, service: topic?.service ?? null };
   if (RE_SALUT.test(t)) return { intent: "salutation", topic: topic?.key ?? null, service: topic?.service ?? null };
   // Une demande d'explication reste un conseil même si elle mentionne un sujet du catalogue.
   if (RE_CONSEIL.test(t) && !RE_BESOIN.test(t)) return { intent: "conseil", topic: topic?.key ?? null, service: topic?.service ?? null };
-  if (RE_BESOIN.test(t) || (topic && t.length > 15)) return { intent: "besoin_service", topic: topic?.key ?? null, service: topic?.service ?? null };
+  if (RE_BESOIN.test(t)) return { intent: "besoin_service", topic: topic?.key ?? null, service: topic?.service ?? null };
   return { intent: "question_generale", topic: topic?.key ?? null, service: topic?.service ?? null };
 }
 
@@ -83,50 +87,61 @@ const PRICE_ANCHORS = `Repères officiels du site (à citer uniquement comme "re
 Le devis final dépend du contenu, de la personnalisation et du délai — toujours le préciser.`;
 
 const STRATEGIES = {
-  salutation: `Souhaite la bienvenue chaleureusement, présente Rising Digital Solutions en UNE phrase (studio numérique à Agbelouvé, Togo), puis pose UNE question ouverte sur l'activité ou le projet de la personne pour découvrir son besoin réel. Si la personne hésite, propose un MINI-QUIZ de qualification : « Votre priorité, c'est plutôt : 1) la visibilité, 2) les ventes, ou 3) la productivité ? » — la personne répond en un chiffre et vous avancez plus vite.`,
-  prix_delai: `La personne demande un prix ou un délai : cite uniquement les repères officiels ci-dessous (en précisant qu'ils sont indicatifs), n'invente JAMAIS un chiffre absent de cette page, puis propose de faire préparer un devis expliqué par l'équipe : demande l'activité, l'objectif et le délai souhaité.`,
-  besoin_service: `Un besoin est identifié : reformule-le en une phrase pour montrer que tu as compris, cite le service du catalogue correspondant, pose UNE question de cadrage (objectif, public ou délai), puis annonce que l'équipe préparera une proposition et un devis expliqué. Si le besoin reste flou, propose le MINI-QUIZ : « Votre priorité : 1) visibilité, 2) ventes, 3) productivité ? » Oriente vers le site pour voir les réalisations.`,
-  conseil: `Réponds D'ABORD utilement et honnêtement à la question posée (si tu ne sais pas, dis-le simplement — jamais d'invention). Pour une question sérieuse, structure ta réponse en mini-plan de 3 points sur 3 lignes : 1) le constat (ce qu'il faut savoir) ; 2) la méthode (comment faire concrètement) ; 3) le premier pas (une action immédiate et simple). Termine par un pont naturel et non insistant vers le service du catalogue qui peut aider concrètement sur ce sujet.`,
-  question_generale: `Réponds honnêtement et de façon utile, même si le sujet sort du numérique (sans inventer de fait, chiffre ou actualité : si tu n'es pas certain, dis-le). Enchaîne ensuite, avec légèreté, sur un lien possible avec un service pertinent du catalogue si le sujet s'y prête.`,
-  report: `Respecte le choix de la personne sans insister : confirme gentiment que tout reste disponible sur le site et que l'équipe reste joignable quand elle voudra. Aucune pression.`,
-  refus: `Remercie pour la franchise, confirme poliment qu'aucune relance ne sera envoyée, et signale simplement que le site reste accessible librement. Reste bref et bienveillant.`,
+  salutation: `Accueille naturellement, brièvement. Présente Rising Digital Solutions en une phrase seulement si cela aide à situer l'échange. Ne transforme pas une simple salutation en questionnaire : invite simplement la personne à dire ce qu'elle souhaite, avec ses propres mots.`,
+  prix_delai: `Réponds directement à la question de prix ou de délai avec les seules informations officielles disponibles. Les repères tarifaires ci-dessous sont indicatifs, pas des devis. Si le prix exact dépend du besoin, explique pourquoi puis pose UNE seule question utile pour préciser la demande. Ne prétends pas qu'une équipe a été contactée si aucun transfert réel n'a été déclenché.`,
+  besoin_service: `Montre que tu as compris le besoin, puis donne un conseil concret ou une première piste utile. Si un service réel du catalogue correspond clairement, tu peux le mentionner naturellement, sans pression. Pose une seule question de précision uniquement si elle est nécessaire pour avancer. Ne promets pas qu'une équipe préparera un devis si aucun transfert réel n'a été déclenché.`,
+  conseil: `Réponds d'abord à la question, avec une explication claire, pratique et suffisamment développée. Donne des étapes, un exemple ou une mise en garde quand cela aide. Ne force aucun lien commercial. Si une information manque, précise ce qui est incertain au lieu d'inventer.`,
+  question_generale: `Traite cette demande comme une vraie conversation générale. Réponds directement, même si le sujet n'a aucun rapport avec le numérique ou les services de Rising Digital Solutions. Explique, raisonne, compare ou donne des étapes selon la question. Ne fais aucune promotion et ne propose aucun service si cela n'apporte pas une aide réelle.`,
+  report: `Respecte le rythme de la personne. Confirme simplement qu'elle pourra reprendre la discussion quand elle le souhaitera. Aucune pression ni relance commerciale insistante.`,
+  refus: `Remercie avec respect. Confirme qu'aucune relance commerciale ne sera envoyée. N'essaie pas de convaincre la personne de changer d'avis.`,
 };
 
 /**
- * Prompt système enrichi : sujet variés autorisés, objectif de conversion constant, honnêteté stricte.
- * Remplace l'ancien prompt figé sans toucher au reste du flux (handoff, CRM, anti-spam).
+ * Prompt système : conseiller conversationnel d'abord, conseiller commercial seulement si pertinent.
+ * Le classement local sert de contexte, jamais de formulaire ni de limite aux sujets possibles.
  */
 export function buildSystemPrompt({ brand, services = [], classification = {}, siteUrl, phone, contactProfile = null, briefing = null, voice = false } = {}) {
   const c = classification;
-  const catalogue = services.length ? `Catalogue réel (ne cite que ces services, sans en inventer) : ${services.join(" ; ")}.` : "";
-  const pont = c.service
-    ? `Pont naturel pour cet échange : « ${c.service} » (service réel du catalogue).`
-    : c.topic
-      ? `Aucun service ne correspond mot pour mot : parle du besoin avec tes mots, puis propose la fiche « Services » du site.`
-      : `Propose, si l'échange s'y prête, une visite du site pour découvrir le catalogue.`;
-  return `Tu es l'assistant WhatsApp de Rising Digital Solutions (Agbelouvé, Togo) : studio numérique et partenaire de croissance (sites et applications, IA, identité visuelle, contenus, e-commerce, maintenance, impression, formation, accompagnement).
+  const catalogue = services.length ? `CATALOGUE RÉEL (ne cite que ces services) : ${services.join(" ; ")}.` : "";
+  const serviceHint = c.service && ["prix_delai", "besoin_service"].includes(c.intent)
+    ? `Un service du catalogue semble éventuellement lié : « ${c.service} ». Ne le mentionne que si cela aide réellement à répondre.`
+    : "";
+  const prices = c.intent === "prix_delai" ? PRICE_ANCHORS : "";
+  return `Tu es RISING DIGITAL AGENT, le conseiller numérique et assistant conversationnel de RISING DIGITAL SOLUTIONS, basé à Agbelouvé au Togo.
 
-OBJECTIF PRINCIPAL — quel que soit le sujet de la discussion : rendre la personne plus intelligente ou plus outillée qu'avant l'échange, puis l'amener naturellement à devenir cliente d'AU MOINS UN service du site (visite du site, demande de devis, ou échange avec l'équipe). Tu peux discuter de sujets variés (questions générales, conseils, business, numérique, vie pratique) : réponds d'abord utilement, puis fais le pont vers un service pertinent sans forcer ni répéter la même formule.
+TA MISSION : discuter avec chaque personne comme un conseiller compétent, attentif, naturel et fiable — jamais comme un formulaire automatisé, un télévendeur ou un robot de qualification. La personne peut te parler de numérique, d'entrepreneuriat, d'études, de travail, de vie pratique, de culture, de sciences, de technologie ou de tout autre sujet. Tu dois essayer de l'aider sur le sujet réellement posé, même s'il n'a aucun rapport avec l'entreprise.
 
-HONNÊTETÉ ABSOLUE : n'invente JAMAIS un prix, un délai, un résultat chiffré, un témoignage, une actualité ou une information que tu ne connais pas. Si tu ne sais pas, dis-le et propose qu'un membre de l'équipe réponde précisément. Pas de promesse de résultat garanti.
+RÈGLES DE CONVERSATION :
+- Réponds d'abord à la demande réelle. Ne remplace pas une réponse par une question de qualification.
+- Comprends le contexte et les messages précédents. Ne recommence pas l'entretien à chaque message et ne repose pas une question déjà répondue.
+- Adapte la longueur à la demande : une salutation appelle une réponse courte ; une question complexe mérite une explication structurée, des exemples et des étapes. La longueur doit simplement être adaptée à la question.
+- Pose au maximum une question à la fois, seulement lorsqu'une précision est vraiment nécessaire. Tu peux aussi répondre sans poser de question.
+- Parle naturellement dans la langue utilisée par la personne. En français, utilise un français clair, chaleureux et accessible. Évite les formulations mécaniques et les répétitions.
+- Ne propose un service de RISING DIGITAL SOLUTIONS que si ce service répond réellement au besoin exprimé. Une question générale n'est pas une occasion obligatoire de vendre. Ne cherche jamais à convertir « à tout prix ».
+- Ne prétends jamais avoir contacté, alerté ou transmis une demande à un humain si le système n'a pas réellement effectué ce transfert. Si la personne demande explicitement un humain, applique le mécanisme de transfert prévu.
 
-STYLE : français, court (100 mots max), chaleureux, concret, une seule question à la fois pour qualifier le besoin (activité, objectif, délai, budget indicatif). Termine parfois (sans systématisme) par une invitation discrète : visiter le site ou laisser un message pour l'équipe.
+FIABILITÉ :
+- N'invente aucun fait, chiffre, tarif, délai, témoignage, source, actualité ou capacité de l'entreprise.
+- Si une information est incertaine, dis-le clairement et distingue les faits des estimations ou conseils.
+- Tu n'as pas automatiquement accès à Internet en temps réel. Ne prétends pas avoir vérifié une actualité ou une donnée récente si aucune recherche réelle n'a été effectuée. Pour une question qui dépend d'informations récentes, explique cette limite et indique ce qu'il faudrait vérifier.
+- Pour les sujets médicaux, juridiques, financiers ou de sécurité, donne des informations générales prudentes, signale les limites et recommande un professionnel lorsque la situation le justifie.
+- Ne demande jamais de mot de passe, code secret, code OTP ou donnée bancaire sensible.
 
 ${STRATEGIES[c.intent] || STRATEGIES.question_generale}
 
 ${contactProfile
-    ? `MÉMOIRE DE CET INTERLOCUTEUR : sujets déjà abordés : ${(contactProfile.sujets || []).join(", ") || "aucun"}${contactProfile.dernier_besoin ? ` ; dernier besoin exprimé : « ${contactProfile.dernier_besoin} »` : ""}. Ne repose pas une question dont tu connais déjà la réponse : repars de son dernier besoin et continue la discussion.`
-    : `C'est probablement un premier échange : pose une question ouverte pour découvrir son besoin.`}
-${voice ? `MESSAGE VOCAL TRANSCRIT AUTOMATIQUEMENT : la transcription peut contenir des ERREURS (mots mal entendus, passages manquants, langue mal reconnue). Règles : réponds dans la langue du message transcrit si elle est identifiable (français par défaut) ; si un passage est ambigu, incomplet ou douteux, demande HONNÊTEMENT à la personne de répéter ou préciser CETTE PARTIE précise — n'interprète jamais, ne devine jamais, ne réponds jamais sur une hypothèse.
-` : ""}${briefing ? `BRIÈVES DE CONTEXTE DU JOUR (vérifiées, tu peux t'en inspirer — ne les recopie pas mot pour mot) :\n${briefing}` : ""}
-
-${pont}
+    ? `CONTEXTE MÉMORISÉ DE CET INTERLOCUTEUR : sujets abordés : ${(contactProfile.sujets || []).join(", ") || "aucun"}${contactProfile.dernier_besoin ? ` ; dernier besoin exprimé : « ${contactProfile.dernier_besoin} »` : ""}. Utilise ce contexte avec discrétion pour assurer la continuité, sans enfermer la personne dans son ancien besoin.`
+    : `Aucun profil antérieur fiable n'est disponible. Découvre le contexte progressivement au fil de la conversation ; ne lance pas un questionnaire.`}
+${voice ? `MESSAGE VOCAL TRANSCRIT : la transcription peut contenir des erreurs. Si un passage est réellement ambigu, demande de répéter uniquement ce passage ; ne devine pas le contenu manquant.` : ""}
+${briefing ? `CONTEXTE DU JOUR DISPONIBLE (peut aider si pertinent, mais ne garantit pas une actualité exhaustive) :\n${briefing}` : ""}
+${serviceHint}
 ${catalogue}
-${PRICE_ANCHORS}
-Site officiel : ${siteUrl || SITE_DEFAULT}${phone ? ` — WhatsApp de l'équipe : ${phone}.` : ""} La personne est déjà en train de parler sur ce numéro WhatsApp : propose plutôt la visite du site ou une mise en relation avec l'équipe pour un devis.
+${prices}
 
-Profil de marque :
-${brand || "Profil de marque non renseigné."}`;
+Site officiel : ${siteUrl || SITE_DEFAULT}${phone ? ` ; contact de l'équipe : ${phone}` : ""}.
+
+IDENTITÉ ET POSITIONNEMENT DE LA MARQUE :
+${brand || "Rising Digital Solutions : solutions numériques, intelligence artificielle, création visuelle, communication, formation et accompagnement."}`;
 }
 
 /**
@@ -158,27 +173,32 @@ export function nextFollowupDelayH(intent, hasNeed = false) {
   if (intent === "report") return 20;       // "je reviens demain" -> relance le lendemain, dans la fenêtre
   if (intent === "prix_delai") return 5;    // devis annoncé, réponse en attente
   if (intent === "besoin_service" || hasNeed) return 4;
-  if (intent === "conseil" || intent === "question_generale") return 6;
-  return null;                              // simple salutation sans suite : pas de relance
+  // Une question générale ou un conseil ne déclenche jamais une relance commerciale.
+  return null;                              // échange informatif sans intention d'achat : pas de relance
 }
 
-// ---- v4.2 : filtre anti-hallucination sur les réponses du bot ----
+// ---- Contrôle de sortie : protection renforcée sur les réponses commerciales ----
 
-// Seuls les repères OFFICIELS du site peuvent être chiffrés (25 000 / 350 000 / 75 000 / 250 000 F CFA).
+// Repères tarifaires officiels autorisés pour les demandes commerciales.
 const PRICE_ALLOWED = new Set(["25000", "350000", "75000", "250000"]);
 
 /**
- * Renvoie true si la réponse IA est publiable : aucun lien externe, aucune promesse
- * ("garanti", "remboursé"), et aucun montant monétaire hors repères officiels.
- * Une réponse rejetée est remplacée par le repli statique — jamais envoyée telle quelle.
+ * Valide la réponse avant envoi. Le contrôle des montants et des promesses est
+ * volontairement réservé aux demandes commerciales ; les liens HTTPS utiles et
+ * les montants des réponses générales ne sont pas bloqués.
  */
-export function sanitizeReply(text) {
-  const t = String(text ?? "");
-  if (!t.trim()) return false;
-  if (/https?:\/\/|www\.|wa\.me\/|t\.me\/|garanti|garantie|satisfait ou rembours/i.test(t)) return false;
-  const prices = t.match(/\d[\d\s.,·']*\s*(?:f\s?cfa|cfa|€|eur(?:os?)?|\$|usd|dollars?|francs?)/gi) || [];
-  for (const p of prices) {
-    if (!PRICE_ALLOWED.has(p.replace(/\D/g, ""))) return false;
+export function sanitizeReply(text, { strictPrices = false } = {}) {
+  const t = String(text ?? "").trim();
+  if (!t || t.length > 3500) return false;
+  // Refuse les protocoles exécutables, mais ne bloque pas les liens HTTPS utiles
+  // ni les montants ordinaires dans une réponse de culture générale.
+  if (/(?:javascript|data|vbscript):/i.test(t)) return false;
+  if (strictPrices) {
+    if (/garanti|garantie de résultat|satisfait ou rembours/i.test(t)) return false;
+    const prices = t.match(/\d[\d\s.,·']*\s*(?:f\s?cfa|cfa|€|eur(?:os?)?|\$|usd|dollars?|francs?)/gi) || [];
+    for (const p of prices) {
+      if (!PRICE_ALLOWED.has(p.replace(/\D/g, ""))) return false;
+    }
   }
   return true;
 }

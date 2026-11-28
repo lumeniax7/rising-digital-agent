@@ -10,9 +10,15 @@ Configurées dans `wrangler.toml` ou modifiables dans le tableau de bord (`meta`
 | `GRAPH_VERSION` | Version de l’API Graph Meta | `v23.0` |
 | `MODE` | `test` / `approval` / `auto`; l’ancien `meta.mode` reste prioritaire | `auto` en production; `test` en local |
 | `WA_COOLDOWN_H` | Délai anti-spam WhatsApp (heures) | `6` |
-| `AI_DAILY_LIMIT` | Plafond global d’appels IA par jour | `200` |
+| `AI_DAILY_LIMIT` | Plafond applicatif d’appels IA par jour (distinct du quota Cloudflare en Neurons) | `200` par défaut ; `5000` dans `wrangler.toml` |
 | `IMAGE_BASE` | URL publique des affiches | URL du Worker |
 | `ALLOWED_ORIGIN` | Origine autorisée pour les appels navigateur externes | `https://lumeniax7.github.io` |
+
+## Modèles IA par défaut
+
+- Conversations et génération : Gemma 4 26B A4B (`@cf/google/gemma-4-26b-a4b-it`) en priorité, GLM 4.7 Flash (`@cf/zai-org/glm-4.7-flash`) en repli.
+- Transcription vocale : Whisper Large v3 Turbo (`@cf/openai/whisper-large-v3-turbo`).
+- Workers AI inclut une allocation gratuite de 10 000 Neurons par jour sur l’offre gratuite Cloudflare ; les appels au-delà de ce quota nécessitent une offre payante et peuvent être facturés.
 
 ## Secrets applicatifs d’exécution
 

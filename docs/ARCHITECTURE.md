@@ -2,7 +2,7 @@
 
 ```
             ┌────────────────────────── Cloudflare Worker ──────────────────────────┐
- WhatsApp ──▶ /webhook ──▶ whatsapp.js ──▶ CRM + mémoire + IA (chat_reply) ──▶ Meta │
+ WhatsApp ──▶ /webhook ──▶ whatsapp.js ──▶ CRM + mémoire + IA conversationnelle (chat_reply) ──▶ Meta │
  Meta/Graph ◀── social/{facebook,instagram}.js ◀── publish.js (états par canal)      │
  Dashboard ──▶ /api/* ──▶ web/router.js ──▶ auth PBKDF2/sessions/CSRF                │
  Cron 07h00 ─▶ generator.js (IA ou gabarit) ─▶ queue.js (jobs, backoff)              │
@@ -16,7 +16,7 @@
 | Module | Rôle |
 |---|---|
 | `core/` | config, utilitaires, crypto (PBKDF2/HMAC), schéma versionné, journal |
-| `ai/` | routeur par tâche (write_post, chat_reply, idea, summarize) + quotas + adapter `providers/*.js` |
+| `ai/` | routeur par tâche (write_post, chat_reply, idea, summarize) + quotas + adapter `providers/*.js` ; modèles par défaut Gemma 4 et GLM 4.7 Flash |
 | `social/` | meta (Graph), facebook, instagram (statut conteneur réel), tiktok (export honnête), whatsapp, publish (orchestrateur) |
 | `content/` | 27 services, moteur éditorial (rotation + anti-répétition Jaccard), générateur |
 | `crm/` | contacts, prospects, qualification |

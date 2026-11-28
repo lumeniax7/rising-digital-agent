@@ -14,14 +14,48 @@ export function ensure(env) {
     for (const s of SERVICES)
       await env.DB.prepare("INSERT OR IGNORE INTO services(tenant_id,slug,title,file,descr) VALUES(?,?,?,?,?)")
         .bind(tid, s.file.replace(".jpg", ""), s.title, s.file, s.desc).run();
+    // Migration douce AVANT le seed : évite de créer un doublon lorsqu'une ancienne
+    // ligne est renommée. Les quotas et l'état enabled de chaque fournisseur sont conservés.
+    const legacy = [
+      ["llama-3.1-8b", "gemma-4-26b-a4b", "@cf/google/gemma-4-26b-a4b-it", 10],
+      ["llama-3.3-70b", "glm-4.7-flash", "@cf/zai-org/glm-4.7-flash", 15],
+    ];
+    for (const task of ["chat_reply", "write_post", "idea", "summarize"]) {
+      const [oldName, newName, model, priority] = legacy[0];
+      const current = await env.DB.prepare("SELECT id FROM ai_providers WHERE task=? AND name=?").bind(task, newName).first();
+      if (current) {
+        await env.DB.prepare("DELETE FROM ai_providers WHERE task=? AND name=? AND model LIKE '@cf/meta/llama-%'").bind(task, oldName).run();
+      } else {
+        await env.DB.prepare(`UPDATE ai_providers SET name=?, adapter='workers-ai', model=?, priority=?
+          WHERE task=? AND name=? AND model LIKE '@cf/meta/llama-%'`).bind(newName, model, priority, task, oldName).run();
+      }
+    }
+    for (const task of ["chat_reply", "write_post"]) {
+      const [oldName, newName, model, priority] = legacy[1];
+      const current = await env.DB.prepare("SELECT id FROM ai_providers WHERE task=? AND name=?").bind(task, newName).first();
+      if (current) {
+        await env.DB.prepare("DELETE FROM ai_providers WHERE task=? AND name=? AND model LIKE '@cf/meta/llama-%'").bind(task, oldName).run();
+      } else {
+        await env.DB.prepare(`UPDATE ai_providers SET name=?, adapter='workers-ai', model=?, priority=?
+          WHERE task=? AND name=? AND model LIKE '@cf/meta/llama-%'`).bind(newName, model, priority, task, oldName).run();
+      }
+    }
+    const whisper = await env.DB.prepare("SELECT id FROM ai_providers WHERE task='transcribe' AND name='whisper-large-v3-turbo'").first();
+    if (whisper) {
+      await env.DB.prepare("DELETE FROM ai_providers WHERE task='transcribe' AND name='whisper' AND model='@cf/openai/whisper'").run();
+    } else {
+      await env.DB.prepare(`UPDATE ai_providers SET name='whisper-large-v3-turbo', model='@cf/openai/whisper-large-v3-turbo'
+        WHERE task='transcribe' AND name='whisper' AND model='@cf/openai/whisper'`).run();
+    }
+
     const provs = [
-      ["write_post", "llama-3.1-8b", "workers-ai", "@cf/meta/llama-3.1-8b-instruct", 10],
-      ["chat_reply", "llama-3.1-8b", "workers-ai", "@cf/meta/llama-3.1-8b-instruct", 10],
-      ["idea", "llama-3.1-8b", "workers-ai", "@cf/meta/llama-3.1-8b-instruct", 20],
-      ["summarize", "llama-3.1-8b", "workers-ai", "@cf/meta/llama-3.1-8b-instruct", 20],
-      ["write_post", "llama-3.3-70b", "workers-ai", "@cf/meta/llama-3.3-70b-instruct-fp8-fast", 15],
-      ["chat_reply", "llama-3.3-70b", "workers-ai", "@cf/meta/llama-3.3-70b-instruct-fp8-fast", 15],
-      ["transcribe", "whisper", "workers-ai", "@cf/openai/whisper", 5],
+      ["write_post", "gemma-4-26b-a4b", "workers-ai", "@cf/google/gemma-4-26b-a4b-it", 10],
+      ["chat_reply", "gemma-4-26b-a4b", "workers-ai", "@cf/google/gemma-4-26b-a4b-it", 10],
+      ["idea", "gemma-4-26b-a4b", "workers-ai", "@cf/google/gemma-4-26b-a4b-it", 20],
+      ["summarize", "gemma-4-26b-a4b", "workers-ai", "@cf/google/gemma-4-26b-a4b-it", 20],
+      ["write_post", "glm-4.7-flash", "workers-ai", "@cf/zai-org/glm-4.7-flash", 15],
+      ["chat_reply", "glm-4.7-flash", "workers-ai", "@cf/zai-org/glm-4.7-flash", 15],
+      ["transcribe", "whisper-large-v3-turbo", "workers-ai", "@cf/openai/whisper-large-v3-turbo", 5],
     ];
     for (const [task, name, adapter, model, prio] of provs)
       await env.DB.prepare("INSERT OR IGNORE INTO ai_providers(task,name,adapter,model,priority,daily_limit) VALUES(?,?,?,?,?,?)")
