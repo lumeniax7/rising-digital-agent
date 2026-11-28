@@ -255,6 +255,23 @@ async function processInboxMessage(env, inbox) {
   await env.DB.prepare("UPDATE conversations SET last_msg_at=?, handoff=? WHERE id=?")
     .bind(new Date().toISOString(), conv.handoff || (HANDOFF.test(text) ? 1 : 0), conv.id).run();
 
+  // Commande admin « résumé maintenant » (v4.3.3) : uniquement depuis le numéro admin,
+  // renvoie immédiatement le digest des 12 dernières heures au lieu d'attendre 07h30/19h00.
+  if (/^(résumé maintenant|resume maintenant|résumé|resume)$/i.test(text.trim())) {
+    const { getAdminPhone } = await import("./alerts.js");
+    const admin = await getAdminPhone(env);
+    if (admin && String(admin) === String(message.from)) {
+      const { conversationDigest } = await import("../reports/reports.js");
+      await conversationDigest(env, tenantId, 12, `Résumé à la demande (${new Date().toISOString().slice(11, 16)} UTC)`);
+      await markCompleted(env, inbox.wamid);
+      await safeLog(env, "info", "digest_admin_demande", `par …${message.from.slice(-4)}`, tenantId);
+      return;
+    }
+    // Envoyé depuis un autre numéro : ignoré silencieusement (pas de confirmation = pas d'indice).
+    await markCompleted(env, inbox.wamid);
+    return;
+  }
+
   const services = (await env.DB.prepare("SELECT title FROM services WHERE tenant_id=? AND active=1").bind(tenantId).all()).results || [];
   const signal = detectLeadSignal(text, services);
   if (signal.hasNeed) {

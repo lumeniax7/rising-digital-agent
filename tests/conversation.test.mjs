@@ -121,3 +121,11 @@ test("digest individuel : format par numéro, action suggérée, jamais de fabri
   assert.match(block, /je veux un site pour ma boutique/);
   assert.equal(buildDigestBlock([]), null);
 });
+
+test("commande admin : variantes reconnues, autres messages ignorés", () => {
+  const ADMIN_CMD = /^(résumé maintenant|resume maintenant|résumé|resume)$/i;
+  for (const t of ["résumé maintenant", "resume maintenant", "Résumé", "RESUME", " résumé "])
+    assert.ok(ADMIN_CMD.test(t.trim()), t);
+  for (const t of ["résume", "resumez", "bonjour", "combien coûte un site ?", "résumé de la semaine", ""])
+    assert.ok(!ADMIN_CMD.test(t.trim()), t);
+});
