@@ -219,7 +219,9 @@ async function processInboxMessage(env, inbox) {
   const message = JSON.parse(inbox.payload);
   const tenantId = inbox.tenant_id;
   let text = message.text?.body || message.button?.text || null;
-  // v4.3.2 : les messages VOCaux sont transcrits (Workers AI Whisper, multilingue).
+  // v4.3.2/v4.3.4 : les messages VOCaux sont transcrits (Workers AI Whisper, multilingue).
+  // La transcription se fait AVANT la création de la conversation (aucune dépendance à conv) ;
+  // la réponse d'échec honnête est envoyée PLUS BAS, une fois conv créé.
   // Honnêteté absolue : si la transcription échoue ou est illisible, on le DIT et on
   // demande de renvoyer/écrire — jamais d'interprétation inventée.
   let voice = false;
@@ -230,7 +232,17 @@ async function processInboxMessage(env, inbox) {
       if (tr && tr.length >= 2) text = tr;
     } catch (e) { await safeLog(env, "warn", "wa_vocal_transcription_echec", e, tenantId); }
   }
+  if (voice && text) text = `[vocal] ${text}`;
+  const contactId = await upsertContact(env, tenantId, "whatsapp", message.from);
+  let conv = await env.DB.prepare("SELECT id, handoff FROM conversations WHERE tenant_id=? AND channel='whatsapp' AND contact_id=? ORDER BY id DESC LIMIT 1")
+    .bind(tenantId, contactId).first();
+  if (!conv) {
+    const inserted = await env.DB.prepare("INSERT INTO conversations(tenant_id,channel,contact_id,last_msg_at) VALUES(?,?,?,?)")
+      .bind(tenantId, "whatsapp", contactId, new Date().toISOString()).run();
+    conv = { id: inserted.meta.last_row_id, handoff: 0 };
+  }
   if (!text) {
+    // Vocaux illisibles ou médias non textuels : réponse honnête (conv existe désormais).
     const reply = voice
       ? "Je n'ai pas réussi à écouter votre message vocal correctement 🙏 Pouvez-vous le renvoyer, ou m'écrire votre demande en texte ? Comme ça je suis sûr de bien vous comprendre."
       : "Merci pour votre message 🙏 Pour l'instant je ne peux lire que du texte : décrivez-moi votre besoin en quelques mots et je vous oriente tout de suite.";
@@ -239,15 +251,6 @@ async function processInboxMessage(env, inbox) {
     await markCompleted(env, inbox.wamid);
     await safeLog(env, "info", "wa_message_non_textuel", `…${message.from.slice(-4)} type=${message.type}`, tenantId);
     return;
-  }
-  if (voice) text = `[vocal] ${text}`;
-  const contactId = await upsertContact(env, tenantId, "whatsapp", message.from);
-  let conv = await env.DB.prepare("SELECT id, handoff FROM conversations WHERE tenant_id=? AND channel='whatsapp' AND contact_id=? ORDER BY id DESC LIMIT 1")
-    .bind(tenantId, contactId).first();
-  if (!conv) {
-    const inserted = await env.DB.prepare("INSERT INTO conversations(tenant_id,channel,contact_id,last_msg_at) VALUES(?,?,?,?)")
-      .bind(tenantId, "whatsapp", contactId, new Date().toISOString()).run();
-    conv = { id: inserted.meta.last_row_id, handoff: 0 };
   }
   // Le message entrant peut déjà exister après une reprise : cela ne doit jamais court-circuiter le traitement.
   await env.DB.prepare("INSERT OR IGNORE INTO messages(tenant_id,conversation_id,direction,external_id,body,ts) VALUES(?,?,?,?,?,?)")
