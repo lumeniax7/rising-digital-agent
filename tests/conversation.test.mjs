@@ -84,3 +84,14 @@ test("mémoire par contact : fusion des sujets et du dernier besoin", () => {
   assert.equal(p2.dernier_service, "Création de site et application");
   assert.ok(p2.sujets.length <= 5);
 });
+
+test("rapport v4.3.1 : ligne publications par canal sans double comptage", async () => {
+  const { publicationLine } = await import("../src/reports/reports.js");
+  const a = { facebook: { ok: 1, echecs: 2, dernier_erreur: "HTTP 190 : jeton expiré" }, instagram: { ok: 3, echecs: 0, dernier_erreur: null } };
+  const line = publicationLine("Publications —", a);
+  assert.match(line, /Facebook : 1 OK \/ 2 échec\(s\)/);
+  assert.match(line, /Instagram : 3 OK \/ 0 échec\(s\)/);
+  assert.match(line, /jeton expiré/);           // l'erreur brute est citée : actionnable
+  const clean = publicationLine("Publications —", { facebook: { ok: 2, echecs: 0, dernier_erreur: null }, instagram: { ok: 2, echecs: 0, dernier_erreur: null } });
+  assert.ok(!clean.includes("dernier échec"));  // pas d'alerte quand tout va bien
+});

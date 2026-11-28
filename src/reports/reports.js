@@ -6,10 +6,23 @@ import { log } from "../core/log.js";
 async function aggregate(env, tenantId, sinceDays) {
   const since = `-${sinceDays} days`;
   const q = async sql => (await env.DB.prepare(sql).bind(tenantId, since).first());
+  // v4.3.1 : métriques PAR CANAL, sans double comptage.
+  // Un post "partial" a réussi sur un canal et échoué sur l'autre : les échecs sont comptés
+  // sur les post_channels (par canal), jamais en double au niveau des posts.
+  const canal = async ch => ({
+    ok: (await q(`SELECT COUNT(DISTINCT pc.post_id) c FROM post_channels pc JOIN posts p ON p.id=pc.post_id
+      WHERE pc.channel='${ch}' AND pc.status='published' AND p.tenant_id=? AND pc.updated_at>datetime('now',?)`)).c,
+    echecs: (await q(`SELECT COUNT(*) c FROM post_channels pc JOIN posts p ON p.id=pc.post_id
+      WHERE pc.channel='${ch}' AND pc.status IN ('error','manual_required') AND p.tenant_id=? AND pc.updated_at>datetime('now',?)`)).c,
+    dernier_erreur: (await env.DB.prepare(`SELECT last_error FROM post_channels pc JOIN posts p ON p.id=pc.post_id
+      WHERE pc.channel='${ch}' AND pc.status IN ('error','manual_required') AND p.tenant_id=? AND pc.updated_at>datetime('now',?)
+        AND last_error IS NOT NULL AND last_error != '' ORDER BY pc.updated_at DESC LIMIT 1`).bind(tenantId, since).first().catch(() => null))?.last_error || null,
+  });
   return {
     posts_publies: (await q("SELECT COUNT(*) c FROM posts WHERE tenant_id=? AND status='published' AND updated_at>datetime('now',?)" )).c,
     posts_partiels: (await q("SELECT COUNT(*) c FROM posts WHERE tenant_id=? AND status='partial' AND updated_at>datetime('now',?)")).c,
-    posts_echecs: (await q("SELECT COUNT(*) c FROM posts WHERE tenant_id=? AND status IN ('error','partial') AND updated_at>datetime('now',?)")).c,
+    facebook: await canal("facebook"),
+    instagram: await canal("instagram"),
     messages_recus: (await q("SELECT COUNT(*) c FROM messages WHERE tenant_id=? AND direction='in' AND ts>datetime('now',?)")).c,
     messages_envoyes: (await q("SELECT COUNT(*) c FROM messages WHERE tenant_id=? AND direction='out' AND ts>datetime('now',?)")).c,
     nouveaux_prospects: (await q("SELECT COUNT(*) c FROM leads WHERE tenant_id=? AND created_at>datetime('now',?)")).c,
@@ -18,18 +31,27 @@ async function aggregate(env, tenantId, sinceDays) {
   };
 }
 
+// Ligne "Publications" par canal : succès / échecs + la DERNIÈRE erreur brute (actionnable).
+export function publicationLine(prefix, a) {
+  const f = a.facebook, i = a.instagram;
+  let line = `${prefix} Facebook : ${f.ok} OK / ${f.echecs} échec(s) · Instagram : ${i.ok} OK / ${i.echecs} échec(s)`;
+  const err = f.dernier_erreur || i.dernier_erreur;
+  if (err) line += `\n   ↳ dernier échec : ${String(err).slice(0, 160)}`;
+  return line;
+}
+
 export async function dailyReport(env) {
   const tenant = await env.DB.prepare("SELECT id FROM tenants LIMIT 1").first();
   const a = await aggregate(env, tenant.id, 1);
   const day = utcDay();
   const lines = [
     `📊 RAPPORT QUOTIDIEN — Rising Digital Agent — ${day}`,
-    `Publications confirmées : ${a.posts_publies} · partielles : ${a.posts_partiels} · échecs : ${a.posts_echecs}`,
+    publicationLine("Publications —", a),
     `WhatsApp : ${a.messages_recus} reçus / ${a.messages_envoyes} réponses envoyées · transferts humain : ${a.transferts_humain}`,
     `Nouveaux prospects : ${a.nouveaux_prospects} · Erreurs IA : ${a.erreurs_ia}`,
   ];
   const alerts = [];
-  if (a.posts_echecs > 0) alerts.push("⚠️ Des publications ont échoué : consultez la vue Publications.");
+  if (a.facebook.echecs > 0 || a.instagram.echecs > 0) alerts.push("⚠️ Des publications ont échoué : consultez la vue Publications (le dernier message d'erreur est cité ci-dessus).");
   if (a.transferts_humain > 0) alerts.push("👤 Des conversations demandent une intervention humaine.");
   const content = lines.join("\n") + (alerts.length ? "\n" + alerts.join("\n") : "");
   await env.DB.prepare("INSERT INTO reports(tenant_id,kind,day,content) VALUES(?,?,?,?) ON CONFLICT(tenant_id,kind,day) DO UPDATE SET content=excluded.content")
@@ -42,11 +64,18 @@ export async function dailyReport(env) {
 export async function weeklyReport(env) {
   const tenant = await env.DB.prepare("SELECT id FROM tenants LIMIT 1").first();
   const a = await aggregate(env, tenant.id, 7);
+  // v4.3 : les 3 sujets les plus demandés sur WhatsApp (7 jours) — pour piloter l'offre.
+  let sujets = "aucun sujet marquant";
+  try {
+    const top = (await env.DB.prepare("SELECT service, COUNT(*) c FROM leads WHERE tenant_id=? AND created_at>datetime('now','-7 days') AND service IS NOT NULL GROUP BY service ORDER BY c DESC LIMIT 3").bind(tenant.id).all()).results || [];
+    if (top.length) sujets = top.map(r => `${r.service} (${r.c})`).join(", ");
+  } catch { /* statistique indicative : jamais bloquante */ }
   const content = [
     `🗓️ BILAN HEBDOMADAIRE — Rising Digital Agent — semaine au ${utcDay()}`,
-    `Publications confirmées : ${a.posts_publies} · partielles : ${a.posts_partiels} · échecs : ${a.posts_echecs}`,
+    publicationLine("Publications —", a),
     `WhatsApp : ${a.messages_recus} reçus / ${a.messages_envoyes} envoyés · transferts humain : ${a.transferts_humain}`,
     `Nouveaux prospects : ${a.nouveaux_prospects}`,
+    `Sujets les plus demandés (7 j) : ${sujets}`,
   ].join("\n");
   await env.DB.prepare("INSERT INTO reports(tenant_id,kind,day,content) VALUES(?,?,?,?) ON CONFLICT(tenant_id,kind,day) DO UPDATE SET content=excluded.content")
     .bind(tenant.id, "weekly", utcDay(), content).run();
