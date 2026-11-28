@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { classifyMessage, detectTopic, buildSystemPrompt, shouldReply, nextFollowupDelayH } from "../src/social/conversation.js";
+import { classifyMessage, detectTopic, buildSystemPrompt, shouldReply, nextFollowupDelayH, sanitizeReply, adjustToDaytime, mergeProfile } from "../src/social/conversation.js";
 
 const HOUR = 3600_000;
 
@@ -57,4 +57,30 @@ test("prompt système : objectif de conversion, honnêteté, catalogue réel, pr
   assert.match(p, /25 000 à 350 000 F CFA/);           // repères officiels du site, jamais inventés
   assert.match(p, /indicatifs/);
   assert.match(p, /https:\/\/risingdigitalsolutions\.pages\.dev/);
+});
+
+test("filtre anti-hallucination : seuls les repères officiels passent", () => {
+  assert.ok(sanitizeReply("Le site vitrine démarre à 25 000 F CFA, à titre indicatif."));
+  assert.ok(sanitizeReply("Les repères vont de 25 000 à 350 000 F CFA et de 75 000 à 250 000 F CFA."));
+  assert.ok(sanitizeReply("Je ne sais pas exactement, l'équipe précisera le devis."));
+  assert.ok(!sanitizeReply("Ça coûte 40 000 F CFA, c'est promis."));       // prix inventé
+  assert.ok(!sanitizeReply("Résultat garanti en 3 jours !"));              // promesse interdite
+  assert.ok(!sanitizeReply("Voir https://exemple.com pour détails"));      // lien externe
+  assert.ok(!sanitizeReply(""));                                           // vide
+});
+
+test("relances jamais la nuit (22h-7h à Lomé = UTC)", () => {
+  assert.equal(adjustToDaytime("2026-11-28T02:30:00Z"), "2026-11-28T09:00:00.000Z");   // nuit -> 9h
+  assert.equal(adjustToDaytime("2026-11-28T23:15:00Z"), "2026-11-29T09:00:00.000Z");   // tard -> lendemain 9h
+  assert.equal(adjustToDaytime("2026-11-28T14:00:00Z"), "2026-11-28T14:00:00Z");       // jour : inchangé
+});
+
+test("mémoire par contact : fusion des sujets et du dernier besoin", () => {
+  const p1 = mergeProfile(null, { intent: "prix_delai", topic: "site_web", service: "Création de site et application" }, "un site pour ma boutique");
+  assert.ok(p1.sujets.includes("site_web") && p1.sujets.includes("Création de site et application"));
+  assert.equal(p1.dernier_besoin, "un site pour ma boutique");
+  const p2 = mergeProfile(p1, { intent: "conseil", topic: "ia", service: null });
+  assert.ok(p2.sujets.includes("ia"));
+  assert.equal(p2.dernier_service, "Création de site et application");
+  assert.ok(p2.sujets.length <= 5);
 });

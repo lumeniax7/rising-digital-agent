@@ -1,7 +1,10 @@
 import { graph } from "./meta.js";
+import { hashtagsForService } from "./conversation.js";
 
 export async function publishPhoto(env, post, settings) {
-  const j = await graph(env, "POST", `/${env.FB_PAGE_ID}/photos`, { url: post.image, message: post.text }, env.FB_PAGE_TOKEN);
+  // v4.3 : hashtags du service publiés automatiquement avec le post (jamais en double).
+  const message = /#\w+/.test(post.text) ? post.text : `${post.text}\n\n${hashtagsForService(post.title || "")}`;
+  const j = await graph(env, "POST", `/${env.FB_PAGE_ID}/photos`, { url: post.image, message }, env.FB_PAGE_TOKEN);
   const id = j.post_id || j.id;
   if (!id) throw new Error("réponse Facebook sans identifiant");
   return String(id);

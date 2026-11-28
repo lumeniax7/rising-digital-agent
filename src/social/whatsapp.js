@@ -6,7 +6,9 @@ import { log } from "../core/log.js";
 import { runAI } from "../ai/router.js";
 import { upsertContact, upsertLead, detectLeadSignal } from "../crm/crm.js";
 import { brandProfile } from "../memory/memory.js";
-import { classifyMessage, buildSystemPrompt, shouldReply, nextFollowupDelayH, cancelScheduledFollowups, scheduleFollowup } from "./conversation.js";
+import { classifyMessage, buildSystemPrompt, shouldReply, nextFollowupDelayH, cancelScheduledFollowups, scheduleFollowup, sanitizeReply, loadContactProfile, saveContactProfile, mergeProfile, lookupFaq, rememberFaq } from "./conversation.js";
+import { parseBriefing } from "../content/briefing.js";
+import AFFICHES from "../content/services.json" with { type: "json" };
 
 const HANDOFF = /(litige|remboursement|plainte|réclamation|parler à (un|une) (humain|personne|agent)|responsable|contrat|paiement direct)/i;
 const MAX_BODY_BYTES = 256 * 1024;
@@ -274,18 +276,70 @@ async function processInboxMessage(env, inbox) {
     }
   }
 
+  // Mémoire par contact (v4.2) : profil local gratuit, injecté dans le prompt. Non bloquant.
+  let contactProfile = null;
+  try {
+    contactProfile = await loadContactProfile(env, tenantId, contactId);
+    await saveContactProfile(env, tenantId, contactId, mergeProfile(contactProfile, classification, signal.hasNeed ? text.slice(0, 200) : null));
+  } catch (e) { await safeLog(env, "warn", "wa_memoire_echec", e, tenantId); }
+
+  // FAQ auto-apprenante (v4.3) : question posée 3+ fois -> réponse instantanée mémorisée,
+  // sans appel IA. Uniquement pour les messages à visée de réponse (pas les salutations pures).
+  if (!["salutation", "refus", "report"].includes(classification.intent)) {
+    try {
+      const faqAnswer = await lookupFaq(env, tenantId, text);
+      if (faqAnswer) {
+        const response = await send(env, message.from, faqAnswer);
+        await persistReply(env, inbox, tenantId, conv.id, response, faqAnswer);
+        await safeLog(env, "info", "wa_reponse_faq", `…${message.from.slice(-4)} (question récurrente)`, tenantId);
+        return;
+      }
+    } catch (e) { await safeLog(env, "warn", "wa_faq_echec", e, tenantId); }
+  }
+
   const brand = await brandProfile(env, tenantId);
+  // Brèves de contexte du jour (v4.3) : générées une fois le matin, réutilisées toute la journée.
+  const briefing = parseBriefing((await env.DB.prepare("SELECT v FROM meta WHERE k='briefing_du_jour'").first().catch(() => null))?.v);
   const history = (await env.DB.prepare("SELECT direction, body FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 6").bind(conv.id).all()).results.reverse();
   const system = buildSystemPrompt({
     brand, services: services.map(s => s.title), classification,
-    siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`,
+    siteUrl: env.SITE_URL, phone: `+228 93 39 25 15`, contactProfile, briefing,
   });
   const msgs = [{ role: "system", content: system }, ...history.map(item => ({ role: item.direction === "in" ? "user" : "assistant", content: item.body }))];
   const ai = await runAI(env, "chat_reply", { messages: msgs, max_tokens: 300 });
-  const reply = ai.ok ? ai.text.slice(0, 1200)
-    : "Bonjour 👋 Merci d'avoir contacté Rising Digital Solutions. Décrivez-nous votre besoin en un message : un membre de l'équipe vous répondra personnellement très vite.";
+  // Filtre anti-hallucination (v4.2) : une réponse contenant un prix hors repères officiels,
+  // un lien externe ou une promesse ("garanti") est rejetée et remplacée par le repli statique.
+  let reply;
+  if (ai.ok && sanitizeReply(ai.text)) {
+    reply = ai.text.slice(0, 1200);
+  } else {
+    if (ai.ok) await safeLog(env, "warn", "ia_reponse_rejetee", "réponse IA rejetée par le filtre anti-hallucination", tenantId);
+    reply = "Bonjour 👋 Merci d'avoir contacté Rising Digital Solutions. Décrivez-nous votre besoin en un message : un membre de l'équipe vous répondra personnellement très vite.";
+  }
+  // Affiche du service détecté (v4.2) : image WhatsApp + légende, envoyée AVANT la réponse texte.
+  // Échec non bloquant : la réponse texte part dans tous les cas.
+  if (classification.service) {
+    const affiche = AFFICHES.find(s => s.title === classification.service);
+    const base = String(env.IMAGE_BASE || "").replace(/\/+$/, "");
+    if (affiche?.file && base.startsWith("https://")) {
+      try {
+        const imgRes = await sendImage(env, message.from, `${base}/affiches/${affiche.file}`,
+          `Rising Digital Solutions — ${classification.service}. Le catalogue complet : ${env.SITE_URL || "https://risingdigitalsolutions.pages.dev"}`);
+        const imgId = imgRes?.messages?.[0]?.id;
+        if (typeof imgId === "string" && imgId) {
+          await env.DB.prepare("INSERT OR IGNORE INTO messages(tenant_id,conversation_id,direction,external_id,body,ts) VALUES(?,?,?,?,?,?)")
+            .bind(tenantId, conv.id, "out", imgId, `[image] ${classification.service}`, new Date().toISOString()).run();
+        }
+      } catch (e) { await safeLog(env, "warn", "wa_image_echec", e, tenantId); }
+    }
+  }
   const response = await send(env, message.from, reply);
   await persistReply(env, inbox, tenantId, conv.id, response, reply);
+  // FAQ auto-apprenante (v4.3) : mémorise question + réponse publiée. Jamais bloquant.
+  try {
+    if (["prix_delai", "besoin_service", "conseil", "question_generale"].includes(classification.intent))
+      await rememberFaq(env, tenantId, text, reply);
+  } catch { /* mémoire FAQ indisponible : sans conséquence */ }
   await safeLog(env, "info", "wa_reponse_envoyee", `…${message.from.slice(-4)} ${ai.ok ? "via " + ai.provider : "(repli statique)"}`, tenantId);
 }
 
@@ -313,4 +367,14 @@ export async function send(env, to, body) {
   if (!phoneId) throw new Error("WhatsApp non configuré");
   return graph(env, "POST", `/${phoneId}/messages`,
     { messaging_product: "whatsapp", to, type: "text", text: { body } }, token);
+}
+
+// Image + légende (v4.2) : sert l'affiche du service détecté via IMAGE_BASE (URL publique figée).
+export async function sendImage(env, to, link, caption) {
+  const token = cleanSecret(env.WA_TOKEN);
+  if (!token) throw new Error("WhatsApp non configuré");
+  const phoneId = cleanSecret(env.WA_PHONE_ID);
+  if (!phoneId) throw new Error("WhatsApp non configuré");
+  return graph(env, "POST", `/${phoneId}/messages`,
+    { messaging_product: "whatsapp", to, type: "image", image: { link, caption } }, token);
 }

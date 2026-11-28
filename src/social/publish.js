@@ -22,6 +22,11 @@ export async function publishChannel(env, post, pc, postStatus) {
     await env.DB.prepare("UPDATE post_channels SET status=?, last_error=?, next_attempt_at=?, updated_at=? WHERE id=?")
       .bind(status, String(msg).slice(0, 500), retry ? new Date(Date.now() + backoffMs(Number(pc.attempts || 0))).toISOString() : null, nowISO(), pc.id).run();
     await log(env, "error", `publication_${pc.channel}_${status}`, `post #${post.id} : ${msg}`);
+    // v4.3 : échec définitif -> l'agent prévient l'admin sur WhatsApp (si numéro configuré).
+    if (!retry) {
+      const { notifyAdmin } = await import("./alerts.js");
+      await notifyAdmin(env, `⚠️ Publication ${pc.channel} en échec définitif (post #${post.id}) : ${String(msg).slice(0, 150)}. Vérifiez le tableau de bord.`).catch(() => {});
+    }
   };
   try {
     if (pc.channel === "facebook") {

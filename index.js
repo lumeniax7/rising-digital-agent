@@ -8,6 +8,8 @@ import { generatePost } from "./content/generator.js";
 import { runDue, enqueue } from "./tasks/queue.js";
 import { dailyReport } from "./reports/reports.js";
 import { processDueFollowups } from "./social/conversation.js";
+import { generateBriefing } from "./content/briefing.js";
+import { prepareDailyStatuses } from "./content/statuts.js";
 import { getMode } from "./core/config.js";
 import { nowISO } from "./core/util.js";
 
@@ -45,7 +47,16 @@ export default {
           await dailyReport(env);
           return;
         }
-        // 07h00 Lomé : génération du post du jour + publication + reprise des travaux en attente
+        if (event.cron === "0 16 * * *") {           // 16h00 Lomé : second post quotidien (visibilité doublée)
+          try { await generatePost(env, tid, { manual: true }); } catch (e) { await log(env, "error", "generation_16h_echec", e.message, tid); }
+          await enqueue(env, "publish_posts", {}, `publish16_${nowISO().slice(0, 13)}`);
+          try { await runDue(env); } catch (e) { await log(env, "error", "publication_16h_echec", e.message, tid); }
+          try { await processDueFollowups(env); } catch (e) { await log(env, "error", "relances_cron_echec", e.message, tid); }
+          return;
+        }
+        // 07h00 Lomé : briefing du jour, 3 statuts WhatsApp prêts à publier, génération du post + publication
+        try { await generateBriefing(env, tid); } catch (e) { await log(env, "error", "briefing_cron_echec", e.message, tid); }
+        try { await prepareDailyStatuses(env, tid); } catch (e) { await log(env, "error", "statuts_cron_echec", e.message, tid); }
         try { await generatePost(env, tid); } catch (e) { await log(env, "error", "generation_echec", e.message, tid); }
         await enqueue(env, "publish_posts", {}, `publish_${nowISO().slice(0, 13)}`);
         try { await runDue(env); } catch (e) { await log(env, "error", "publication_cron_echec", e.message, tid); }

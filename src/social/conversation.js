@@ -1,4 +1,5 @@
-// Moteur de conversation v4.1 — diversification des sujets, conversion en client, relances.
+// Moteur de conversation v4.2 — diversification des sujets, conversion en client, relances,
+// filtre anti-hallucination, mémoire par contact, envois de jour uniquement.
 // Principes : (1) le classement du message est local et gratuit (aucun appel IA supplémentaire) ;
 // (2) honnêteté absolue — jamais de prix, délai ou information inventés, "je ne sais pas" autorisé ;
 // (3) l'existant (webhook, CRM, handoff humain, anti-spam, quotas IA) reste inchangé : on s'y branche.
@@ -6,6 +7,7 @@
 import { nowISO } from "../core/util.js";
 import { log } from "../core/log.js";
 import { runAI } from "../ai/router.js";
+import { getMemory, setMemory } from "../memory/memory.js";
 
 const SITE_DEFAULT = "https://risingdigitalsolutions.pages.dev";
 
@@ -81,10 +83,10 @@ const PRICE_ANCHORS = `Repères officiels du site (à citer uniquement comme "re
 Le devis final dépend du contenu, de la personnalisation et du délai — toujours le préciser.`;
 
 const STRATEGIES = {
-  salutation: `Souhaite la bienvenue chaleureusement, présente Rising Digital Solutions en UNE phrase (studio numérique à Agbelouvé, Togo), puis pose UNE question ouverte sur l'activité ou le projet de la personne pour découvrir son besoin réel.`,
+  salutation: `Souhaite la bienvenue chaleureusement, présente Rising Digital Solutions en UNE phrase (studio numérique à Agbelouvé, Togo), puis pose UNE question ouverte sur l'activité ou le projet de la personne pour découvrir son besoin réel. Si la personne hésite, propose un MINI-QUIZ de qualification : « Votre priorité, c'est plutôt : 1) la visibilité, 2) les ventes, ou 3) la productivité ? » — la personne répond en un chiffre et vous avancez plus vite.`,
   prix_delai: `La personne demande un prix ou un délai : cite uniquement les repères officiels ci-dessous (en précisant qu'ils sont indicatifs), n'invente JAMAIS un chiffre absent de cette page, puis propose de faire préparer un devis expliqué par l'équipe : demande l'activité, l'objectif et le délai souhaité.`,
-  besoin_service: `Un besoin est identifié : reformule-le en une phrase pour montrer que tu as compris, cite le service du catalogue correspondant, pose UNE question de cadrage (objectif, public ou délai), puis annonce que l'équipe préparera une proposition et un devis expliqué. Oriente vers le site pour voir les réalisations.`,
-  conseil: `Réponds D'ABORD utilement et honnêtement à la question posée (si tu ne sais pas, dis-le simplement — jamais d'invention), puis fais un pont naturel et non insistant vers le service du catalogue qui peut aider concrètement sur ce sujet.`,
+  besoin_service: `Un besoin est identifié : reformule-le en une phrase pour montrer que tu as compris, cite le service du catalogue correspondant, pose UNE question de cadrage (objectif, public ou délai), puis annonce que l'équipe préparera une proposition et un devis expliqué. Si le besoin reste flou, propose le MINI-QUIZ : « Votre priorité : 1) visibilité, 2) ventes, 3) productivité ? » Oriente vers le site pour voir les réalisations.`,
+  conseil: `Réponds D'ABORD utilement et honnêtement à la question posée (si tu ne sais pas, dis-le simplement — jamais d'invention). Pour une question sérieuse, structure ta réponse en mini-plan de 3 points sur 3 lignes : 1) le constat (ce qu'il faut savoir) ; 2) la méthode (comment faire concrètement) ; 3) le premier pas (une action immédiate et simple). Termine par un pont naturel et non insistant vers le service du catalogue qui peut aider concrètement sur ce sujet.`,
   question_generale: `Réponds honnêtement et de façon utile, même si le sujet sort du numérique (sans inventer de fait, chiffre ou actualité : si tu n'es pas certain, dis-le). Enchaîne ensuite, avec légèreté, sur un lien possible avec un service pertinent du catalogue si le sujet s'y prête.`,
   report: `Respecte le choix de la personne sans insister : confirme gentiment que tout reste disponible sur le site et que l'équipe reste joignable quand elle voudra. Aucune pression.`,
   refus: `Remercie pour la franchise, confirme poliment qu'aucune relance ne sera envoyée, et signale simplement que le site reste accessible librement. Reste bref et bienveillant.`,
@@ -94,7 +96,7 @@ const STRATEGIES = {
  * Prompt système enrichi : sujet variés autorisés, objectif de conversion constant, honnêteté stricte.
  * Remplace l'ancien prompt figé sans toucher au reste du flux (handoff, CRM, anti-spam).
  */
-export function buildSystemPrompt({ brand, services = [], classification = {}, siteUrl, phone } = {}) {
+export function buildSystemPrompt({ brand, services = [], classification = {}, siteUrl, phone, contactProfile = null, briefing = null } = {}) {
   const c = classification;
   const catalogue = services.length ? `Catalogue réel (ne cite que ces services, sans en inventer) : ${services.join(" ; ")}.` : "";
   const pont = c.service
@@ -111,6 +113,11 @@ HONNÊTETÉ ABSOLUE : n'invente JAMAIS un prix, un délai, un résultat chiffré
 STYLE : français, court (100 mots max), chaleureux, concret, une seule question à la fois pour qualifier le besoin (activité, objectif, délai, budget indicatif). Termine parfois (sans systématisme) par une invitation discrète : visiter le site ou laisser un message pour l'équipe.
 
 ${STRATEGIES[c.intent] || STRATEGIES.question_generale}
+
+${contactProfile
+    ? `MÉMOIRE DE CET INTERLOCUTEUR : sujets déjà abordés : ${(contactProfile.sujets || []).join(", ") || "aucun"}${contactProfile.dernier_besoin ? ` ; dernier besoin exprimé : « ${contactProfile.dernier_besoin} »` : ""}. Ne repose pas une question dont tu connais déjà la réponse : repars de son dernier besoin et continue la discussion.`
+    : `C'est probablement un premier échange : pose une question ouverte pour découvrir son besoin.`}
+${briefing ? `BRIÈVES DE CONTEXTE DU JOUR (vérifiées, tu peux t'en inspirer — ne les recopie pas mot pour mot) :\n${briefing}` : ""}
 
 ${pont}
 ${catalogue}
@@ -150,6 +157,122 @@ export function nextFollowupDelayH(intent, hasNeed = false) {
   return null;                              // simple salutation sans suite : pas de relance
 }
 
+// ---- v4.2 : filtre anti-hallucination sur les réponses du bot ----
+
+// Seuls les repères OFFICIELS du site peuvent être chiffrés (25 000 / 350 000 / 75 000 / 250 000 F CFA).
+const PRICE_ALLOWED = new Set(["25000", "350000", "75000", "250000"]);
+
+/**
+ * Renvoie true si la réponse IA est publiable : aucun lien externe, aucune promesse
+ * ("garanti", "remboursé"), et aucun montant monétaire hors repères officiels.
+ * Une réponse rejetée est remplacée par le repli statique — jamais envoyée telle quelle.
+ */
+export function sanitizeReply(text) {
+  const t = String(text ?? "");
+  if (!t.trim()) return false;
+  if (/https?:\/\/|www\.|wa\.me\/|t\.me\/|garanti|garantie|satisfait ou rembours/i.test(t)) return false;
+  const prices = t.match(/\d[\d\s.,·']*\s*(?:f\s?cfa|cfa|€|eur(?:os?)?|\$|usd|dollars?|francs?)/gi) || [];
+  for (const p of prices) {
+    if (!PRICE_ALLOWED.has(p.replace(/\D/g, ""))) return false;
+  }
+  return true;
+}
+
+// ---- v4.2 : relances jamais la nuit (Lomé = UTC, donc 22h-7h locales = UTC) ----
+
+/**
+ * Ajuste une échéance ISO : entre 22h et 7h, la repousse au prochain 09h00.
+ * Une relance à 2h du matin tue la conversion et paraît suspecte.
+ */
+export function adjustToDaytime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const h = d.getUTCHours();
+  if (h < 7) return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 9, 0, 0)).toISOString();
+  if (h >= 22) return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 9, 0, 0)).toISOString();
+  return iso;
+}
+
+// ---- v4.2 : mémoire par contact (profil persistant, gratuit, table memory existante) ----
+
+export async function loadContactProfile(env, tenantId, contactId) {
+  try {
+    const raw = await getMemory(env, tenantId, `contact:${contactId}`, "profil");
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; } // mémoire indisponible : le reste du flux continue
+}
+
+export async function saveContactProfile(env, tenantId, contactId, profile) {
+  await setMemory(env, tenantId, `contact:${contactId}`, "profil", JSON.stringify(profile));
+}
+
+/** Fusion pure (testable) : sujets déjà abordés (5 max), dernier service, dernier besoin. */
+export function mergeProfile(existing, classification, need = null) {
+  const p = existing && typeof existing === "object" ? existing : {};
+  const sujets = new Set([...(Array.isArray(p.sujets) ? p.sujets : [])]);
+  if (classification?.topic) sujets.add(classification.topic);
+  if (classification?.service) sujets.add(classification.service);
+  return {
+    sujets: [...sujets].slice(-5),
+    dernier_service: classification?.service || p.dernier_service || null,
+    dernier_besoin: need || p.dernier_besoin || null,
+    maj: nowISO(),
+  };
+}
+
+// ---- v4.3 : FAQ auto-apprenante (réponse instantanée aux questions récurrentes) ----
+// Chaque question posée 3+ fois stocke sa meilleure réponse ; les suivantes partent
+// sans appel IA (économie de quota, cohérence). Clé = 4 mots significatifs principaux.
+
+import { normWords, jaccard } from "../core/util.js";
+
+export function faqKey(text) {
+  return [...normWords(text)].sort().slice(0, 4).join("-").slice(0, 80) || "divers";
+}
+
+/** Vrai si deux questions sont les mêmes au sens pratique (similarité > 0.6). */
+export function sameQuestion(a, b) {
+  return a.length > 8 && b.length > 8 && jaccard(a, b) > 0.6;
+}
+
+export async function lookupFaq(env, tenantId, text) {
+  const rows = (await env.DB.prepare("SELECT key, value FROM memory WHERE tenant_id=? AND scope='faq'").bind(tenantId).all()).results || [];
+  for (const r of rows) {
+    let entry;
+    try { entry = JSON.parse(r.value); } catch { continue; }
+    if (entry?.count >= 3 && entry?.answer && (r.key === faqKey(text) || sameQuestion(entry.question, text))) return entry.answer;
+  }
+  return null;
+}
+
+/** Enregistre/renforce une question-réponse. Jamais bloquant : échec = silencieux. */
+export async function rememberFaq(env, tenantId, text, answer) {
+  const key = faqKey(text);
+  const ex = await env.DB.prepare("SELECT value FROM memory WHERE tenant_id=? AND scope='faq' AND key=?").bind(tenantId, key).first();
+  let entry = { question: String(text).slice(0, 200), answer: String(answer).slice(0, 500), count: 0 };
+  if (ex?.value) { try { entry = { ...entry, ...JSON.parse(ex.value) }; } catch { /* repartir à neuf */ } }
+  entry.count = Number(entry.count || 0) + 1;
+  await setMemory(env, tenantId, "faq", key, JSON.stringify(entry));
+}
+
+// ---- v4.3 : hashtag + affiche du service pour Facebook (publiés AVEC le post) ----
+
+export function hashtagsForService(serviceTitle) {
+  const base = ["#RisingDigital", "#Togo", "#Numérique", "#Entrepreneuriat"];
+  const mots = normWords(serviceTitle);
+  const map = {
+    "creation": ["#Création"], "site": ["#SiteWeb"], "application": ["#Application"],
+    "intelligence": ["#IA"], "artificielle": ["#IA"], "commerce": ["#Ecommerce"],
+    "graphique": ["#Graphisme"], "identite": ["#IdentitéVisuelle"], "formation": ["#Formation"],
+    "maintenance": ["#Maintenance"], "impression": ["#Impression"], "reseaux": ["#RéseauxSociaux"],
+    "communication": ["#Communication"], "marketing": ["#Marketing"], "photographe": ["#Photographie"],
+    "donnees": ["#Données"], "documents": ["#Documents"], "entrepreneuriat": ["#Entrepreneuriat"],
+  };
+  const extra = new Set();
+  for (const w of mots) for (const tag of map[w] || []) extra.add(tag);
+  return [...extra, ...base].slice(0, 6).join(" ");
+}
+
 // ---- Persistance des relances (table followups, migration 0003) ----
 
 export async function cancelScheduledFollowups(env, conversationId) {
@@ -161,7 +284,7 @@ export async function scheduleFollowup(env, { tenantId, contactId, conversationI
   const ex = await env.DB.prepare("SELECT id FROM followups WHERE conversation_id=? AND status='scheduled'").bind(conversationId).first();
   if (ex) return ex.id;
   const r = await env.DB.prepare("INSERT INTO followups(tenant_id,contact_id,conversation_id,angle,due_at,created_at) VALUES(?,?,?,?,?,?)")
-    .bind(tenantId, contactId, conversationId, angle, dueAt, nowISO()).run();
+    .bind(tenantId, contactId, conversationId, angle, adjustToDaytime(dueAt), nowISO()).run();
   return r.meta.last_row_id;
 }
 
@@ -232,7 +355,7 @@ export async function processDueFollowups(env, limit = 10) {
         result.failed++;
       } else {
         await env.DB.prepare("UPDATE followups SET status='scheduled', due_at=?, updated_at=? WHERE id=?")
-          .bind(new Date(Date.now() + 2 * 3600_000).toISOString(), nowISO(), f.id).run();
+          .bind(adjustToDaytime(new Date(Date.now() + 2 * 3600_000).toISOString()), nowISO(), f.id).run();
         result.deferred++;
       }
       await log(env, "warn", "relance_echec", String(e?.message ?? e).slice(0, 300), f.tenant_id).catch(() => {});
