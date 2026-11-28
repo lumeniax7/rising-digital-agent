@@ -123,11 +123,12 @@ test("digest individuel : format par numéro, action suggérée, jamais de fabri
 });
 
 test("commande admin : variantes reconnues, autres messages ignorés", () => {
-  const ADMIN_CMD = /^(résumé maintenant|resume maintenant|résumé|resume)$/i;
-  for (const t of ["résumé maintenant", "resume maintenant", "Résumé", "RESUME", " résumé "])
-    assert.ok(ADMIN_CMD.test(t.trim()), t);
-  for (const t of ["résume", "resumez", "bonjour", "combien coûte un site ?", "résumé de la semaine", ""])
-    assert.ok(!ADMIN_CMD.test(t.trim()), t);
+  const norm = t => t.trim().replace(/^envoi[ez]?[\s-]+(le\s+|moi\s+(?:le\s+)?|le\s+)?/i, "");
+  const ADMIN_CMD = /(résum[ée]|resume)(\s+(maintenant|de\s+la\s+semaine|du\s+jour)|z|z\s+maintenant)?$/i;
+  for (const t of ["résumé maintenant", "resume maintenant", "Résumé", "RESUME", " résumé ", "resumez", "Résumé de la semaine", "envoie le résumé", "envoie-moi le résumé", "resume du jour"])
+    assert.ok(ADMIN_CMD.test(norm(t)), t);
+  for (const t of ["bonjour", "combien coûte un site ?", ""])
+    assert.ok(!ADMIN_CMD.test(norm(t)), t);
 });
 
 test("numéro admin : comparaison insensible au format", () => {

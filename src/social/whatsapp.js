@@ -219,27 +219,41 @@ async function processInboxMessage(env, inbox) {
   const message = JSON.parse(inbox.payload);
   const tenantId = inbox.tenant_id;
   let text = message.text?.body || message.button?.text || null;
-  // v4.3.2/v4.3.4 : les messages VOCaux sont transcrits (Workers AI Whisper, multilingue).
-  // La transcription se fait AVANT la création de la conversation (aucune dépendance à conv) ;
-  // la réponse d'échec honnête est envoyée PLUS BAS, une fois conv créé.
-  // Honnêteté absolue : si la transcription échoue ou est illisible, on le DIT et on
-  // demande de renvoyer/écrire — jamais d'interprétation inventée.
+  // v4.3.2/v4.3.5 : les messages VOCaux sont transcrits (Workers AI Whisper, multilingue).
+  // CEINTURE DE SÉCURITÉ : toute cette branche (transcription -> contact -> conversation)
+  // est enveloppée dans un try/catch de secours — AUCUN crash ne peut bloquer la réponse
+  // (ni la commande admin « résumé ») : au pire, la transcription échoue et text reste null.
   let voice = false;
-  if (!text && message.type === "audio" && message.audio?.id) {
-    voice = true;
+  let contactId = null, conv = null;
+  try {
+    if (!text && message.type === "audio" && message.audio?.id) {
+      voice = true;
+      try {
+        const tr = await transcribeAudio(env, message.audio.id);
+        if (tr && tr.length >= 2) text = tr;
+      } catch (e) { await safeLog(env, "warn", "wa_vocal_transcription_echec", e, tenantId); }
+    }
+    if (voice && text) text = `[vocal] ${text}`;
+    contactId = await upsertContact(env, tenantId, "whatsapp", message.from);
+    conv = await env.DB.prepare("SELECT id, handoff FROM conversations WHERE tenant_id=? AND channel='whatsapp' AND contact_id=? ORDER BY id DESC LIMIT 1")
+      .bind(tenantId, contactId).first();
+    if (!conv) {
+      const inserted = await env.DB.prepare("INSERT INTO conversations(tenant_id,channel,contact_id,last_msg_at) VALUES(?,?,?,?)")
+        .bind(tenantId, "whatsapp", contactId, new Date().toISOString()).run();
+      conv = { id: inserted.meta.last_row_id, handoff: 0 };
+    }
+  } catch (e) {
+    // Dernier recours : on tente de répondre honnêtement sans conversation persistée.
+    await safeLog(env, "error", "wa_branche_vocal_echec", e, tenantId);
     try {
-      const tr = await transcribeAudio(env, message.audio.id);
-      if (tr && tr.length >= 2) text = tr;
-    } catch (e) { await safeLog(env, "warn", "wa_vocal_transcription_echec", e, tenantId); }
-  }
-  if (voice && text) text = `[vocal] ${text}`;
-  const contactId = await upsertContact(env, tenantId, "whatsapp", message.from);
-  let conv = await env.DB.prepare("SELECT id, handoff FROM conversations WHERE tenant_id=? AND channel='whatsapp' AND contact_id=? ORDER BY id DESC LIMIT 1")
-    .bind(tenantId, contactId).first();
-  if (!conv) {
-    const inserted = await env.DB.prepare("INSERT INTO conversations(tenant_id,channel,contact_id,last_msg_at) VALUES(?,?,?,?)")
-      .bind(tenantId, "whatsapp", contactId, new Date().toISOString()).run();
-    conv = { id: inserted.meta.last_row_id, handoff: 0 };
+      const reply = voice
+        ? "Je n'ai pas réussi à écouter votre message vocal correctement 🙏 Pouvez-vous le renvoyer, ou m'écrire votre demande en texte ? Comme ça je suis sûr de bien vous comprendre."
+        : "Merci pour votre message 🙏 Une petite difficulté technique est survenue : réécrivez-moi votre demande en quelques mots et je vous réponds tout de suite.";
+      const response = await send(env, message.from, reply);
+      await persistReply(env, inbox, tenantId, 0, response, reply);
+    } catch (e2) { await safeLog(env, "warn", "wa_secours_echec", e2, tenantId); }
+    await markCompleted(env, inbox.wamid);
+    return;
   }
   if (!text) {
     // Vocaux illisibles ou médias non textuels : réponse honnête (conv existe désormais).
@@ -260,7 +274,8 @@ async function processInboxMessage(env, inbox) {
 
   // Commande admin « résumé maintenant » (v4.3.3) : uniquement depuis le numéro admin,
   // renvoie immédiatement le digest des 12 dernières heures au lieu d'attendre 07h30/19h00.
-  if (/^(résumé maintenant|resume maintenant|résumé|resume)$/i.test(text.trim())) {
+  const digestCmd = text.trim().replace(/^envoi[ez]?[\s-]+(le\s+|moi\s+(?:le\s+)?|le\s+)?/i, "");
+  if (/(résum[ée]|resume)(\s+(maintenant|de\s+la\s+semaine|du\s+jour)|z|z\s+maintenant)?$/i.test(digestCmd) && !/^résume$/i.test(digestCmd)) {
     const { getAdminPhone } = await import("./alerts.js");
     const admin = await getAdminPhone(env);
     // Comparaison insensible au format : "+228 90 68 10 92", "00228…", "90681092"…
