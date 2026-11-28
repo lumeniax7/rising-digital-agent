@@ -129,3 +129,9 @@ test("commande admin : variantes reconnues, autres messages ignorés", () => {
   for (const t of ["résume", "resumez", "bonjour", "combien coûte un site ?", "résumé de la semaine", ""])
     assert.ok(!ADMIN_CMD.test(t.trim()), t);
 });
+
+test("numéro admin : comparaison insensible au format", () => {
+  const normPhone = v => { const d = String(v ?? "").replace(/\D/g, ""); return d.startsWith("00228") ? d.slice(5) : d.startsWith("228") && d.length > 8 ? d.slice(3) : d; };
+  const pairs = [["22890681092", "+228 90 68 10 92"], ["22890681092", "90681092"], ["+22890681092", "0022890681092"]];
+  for (const [a, b] of pairs) assert.equal(normPhone(a), normPhone(b), `${a} vs ${b}`);
+});

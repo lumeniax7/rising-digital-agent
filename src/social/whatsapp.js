@@ -260,7 +260,9 @@ async function processInboxMessage(env, inbox) {
   if (/^(résumé maintenant|resume maintenant|résumé|resume)$/i.test(text.trim())) {
     const { getAdminPhone } = await import("./alerts.js");
     const admin = await getAdminPhone(env);
-    if (admin && String(admin) === String(message.from)) {
+    // Comparaison insensible au format : "+228 90 68 10 92", "00228…", "90681092"…
+    const normPhone = v => { const d = String(v ?? "").replace(/\D/g, ""); return d.startsWith("00228") ? d.slice(5) : d.startsWith("228") && d.length > 8 ? d.slice(3) : d; };
+    if (admin && normPhone(admin) === normPhone(message.from)) {
       const { conversationDigest } = await import("../reports/reports.js");
       await conversationDigest(env, tenantId, 12, `Résumé à la demande (${new Date().toISOString().slice(11, 16)} UTC)`);
       await markCompleted(env, inbox.wamid);
